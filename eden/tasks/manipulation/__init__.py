@@ -26,6 +26,8 @@ Registered tasks, all on the ``Droid`` robot unless noted:
   of YCB objects.
 * ``manipulation_dex_lift`` (``dex_lift/config.py``) — ``manipulation_lift_box`` with the 12-DOF ``XHand1_L``
   dexterous hand instead of the 2F85.
+* ``manipulation_g1_beaker_lift`` (``g1_beaker_lift/config.py``) — ``manipulation_dex_lift`` on a pelvis-welded
+  Unitree G1 with Dex3 hands, lifting a beaker off a lab bench and keeping it upright.
 
 Other robots reuse the MDP terms in :mod:`eden.tasks.manipulation.custom_terms` and the composite manipulator
 specs in :mod:`eden.options.robots.composite` (``Droid`` / ``COMPOSITE_ROBOT_REGISTRY``).

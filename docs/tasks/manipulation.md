@@ -14,6 +14,7 @@ from the [task index](index.md), which also has the commands every task shares.
 | [`manipulation_lift_box_rgb`](#lift-box-from-rgb) | Franka Panda + Robotiq 2F-85 | — | 1024 |
 | [`manipulation_lift_ycb_rgb`](#lift-ycb-from-rgb) | Franka Panda + Robotiq 2F-85 | `--object_properties` | 1024 |
 | [`manipulation_dex_lift`](#dexterous-lift) | Franka + XHand1 (left) | — | 4096 |
+| [`manipulation_g1_beaker_lift`](#g1-beaker-lift) | Unitree G1 + Dex3 hands, pelvis welded | — | 4096 |
 | [`reorient`](#in-hand-reorientation) | Wuji Hand 1 (simplified collision model) | `--hand` | 4096 |
 | [`piano`](#piano) | Two Wuji Hand 2 (beta2) | `--song` | 1024 |
 | [`omnireset`](#omnireset) | UR5e + Robotiq 2F-85 | `--robot` | 4096 |
@@ -147,6 +148,32 @@ The policy is trained to be deployed on the real rig:
     each control step. The Franka and XHand backends ship with Eden; the AprilTag observer that does that write is
     not in Eden yet, and MuJoCo sim-to-sim cannot load this rig yet (the module docstring of
     `eden/tasks/manipulation/dex_lift/config.py` explains why).
+
+## G1 beaker lift
+
+`manipulation_g1_beaker_lift` is the dexterous lift on a humanoid at a lab bench: a `G1Dofs29Dex3` picks a 250 mL
+beaker (a 7 × 9.5 cm cylinder, 0.12–0.30 kg) off a 0.85 m bench with its right Dex3 hand, keeps it upright, and holds
+it at a goal 10–25 cm above the bench. It reuses the dexterous lift's reward structure and curricula.
+
+```bash
+eden train --task manipulation_g1_beaker_lift
+```
+
+- **Upper body only.** The pelvis is welded to an invisible fixed mount (the G1 MJCF's free base cannot take
+  `is_fixed_base=True`). The action is 13-D: differential IK at the right palm over the seven right-arm joints, whose
+  deltas accumulate on the last joint target so the arm holds its pose without gravity compensation, and a joint PD
+  over the seven right Dex3 joints. Every other joint is held at its default, and only the right forearm and hand
+  collide.
+- **Reach decides the layout.** With the pelvis and waist fixed the palm reaches about 35–45 cm forward, so the bench
+  is a slab with knee room under it, 20 cm from the pelvis, and the beaker starts anywhere in 12 × 30 cm in front of
+  the right shoulder. The arm starts raised behind the bench edge, clear of the beaker.
+- **The beaker must stay upright.** An `object_tilt` metric (`1 − cos` of the tilt) is penalized and ends the episode
+  past 45°.
+- **The beaker is moved before the grasp.** `DisplaceRestingObject` teleports a resting beaker the hand has not
+  reached yet to a fresh spot, at random intervals, so the policy re-targets a beaker someone moved.
+- **State-based, deployment-shaped observations.** The policy sees the arm and hand encoders, forward kinematics of
+  them, the goal, its last action and a noised beaker pose with a 3-frame history (what a perception module would
+  supply); the critic also sees the fingertip-to-beaker offsets and the beaker's velocity.
 
 ## In-hand reorientation
 

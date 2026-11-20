@@ -115,6 +115,7 @@ assembly and hand-object tracking.
 | `manipulation_lift_box_rgb` | Franka Panda + Robotiq 2F-85 | The same, finding the box in a wrist RGB camera |
 | `manipulation_lift_ycb_rgb` | Franka Panda + Robotiq 2F-85 | Lift a different YCB object in each env, from a wrist RGB camera |
 | `manipulation_dex_lift` | Franka + XHand (left) | Grasp and lift a cube with a 12-DOF dexterous hand |
+| `manipulation_g1_beaker_lift` | Unitree G1 + Dex3 (pelvis welded) | Pick a beaker off a lab bench with the right hand and hold it upright at a 3D goal |
 | `reorient` | Wuji Hand 1 | Rotate a cube in the hand to a stream of target orientations |
 | `piano` | Two Wuji Hand 2 | Play a song on an 88-key keyboard |
 | `omnireset` | UR5e + Robotiq 2F-85 | Assemble an object pair, starting from recorded reset states |
