@@ -2,9 +2,8 @@
 right Dex3 hand, keeps it upright, and holds it at a 3D goal.
 
 The humanoid counterpart of :class:`~eden.tasks.manipulation.dex_lift.config.ManipulationDexLiftConfig`
-(``manipulation_dex_lift``): the same reach / wrap / lift / goal-tracking reward structure, goal-range curriculum,
-staged smoothness curricula and contact stiffening, on a :class:`~eden.options.robots.G1Dofs29Dex3` instead of a
-table-mounted Franka + XHand. What changes:
+(``manipulation_dex_lift``): its goal tracking, goal-range curriculum, staged smoothness curricula and contact
+stiffening, on a :class:`~eden.options.robots.G1Dofs29Dex3` instead of a table-mounted Franka + XHand. What changes:
 
 * **The pelvis is welded in place.** Balance is out of scope: the task is the upper body at a bench, and a deployment
   stands the robot with a lower-body controller. The G1 MJCF's base carries a free joint, which ``is_fixed_base``
@@ -24,8 +23,19 @@ table-mounted Franka + XHand. What changes:
 * **The arm starts ready.** The asset's default arm hangs below the bench top. The right arm's default is a ready
   pose instead: the hand raised behind the bench edge, clear of everywhere the beaker can be (a hand above the beaker
   area sags onto it under gravity and tips it). The arm starts every episode there.
+* **The waist and the right arm are stiff.** The asset's gains are the whole-body trackers' (waist roll and pitch
+  kp 28.5, arm kp 14.3), and with nothing driving the waist the torso sagged 27-28 deg under the reaching arm: no
+  scripted grasp could lift the beaker. At kp 300 on the waist and 60 on the arm, every one of 40 could.
+* **A grasp is contact, and it is what pays.** The first version kept ``manipulation_dex_lift``'s distance-based
+  approach rewards at full weight, and its policy lay the open hand around the beaker's foot, collecting them for
+  good without ever closing. Now :class:`OpposedGrasp` (thumb and fingers both pressing the beaker) is a rewarded
+  metric that gates the lift-height reward, :class:`GraspClosure` pays the fingers for closing at the beaker, the
+  approach terms are worth at most 5 a step against up to 45 for a grasp and lift, and pressing the bench costs.
+* **A quarter of the episodes start at the grasp.** :class:`StartAtPregrasp` puts the open hand around the beaker
+  at its home (a pose from which a scripted closure lifts it), so the lift is found early.
 * **The beaker must stay upright.** :func:`object_tilt` (``1 - cos`` of the beaker's tilt) is a metric that a
-  penalty reads and that ends the episode past 45 degrees: a tipped beaker has spilled.
+  penalty reads once the beaker is off the bench (on it, the penalty only taught the hand not to close) and that
+  ends the episode past 45 degrees wherever it is: a tipped beaker has spilled.
 * **The beaker is moved before it is grasped.** At random intervals :class:`DisplaceRestingObject` teleports the
   beaker to a fresh spot, but only while it rests on the bench and the hand is not at it, so the policy learns to
   re-target a beaker someone moved.
@@ -40,6 +50,7 @@ with a little liquid in it.
 
 from __future__ import annotations
 
+from fnmatch import fnmatchcase
 from typing import TYPE_CHECKING
 
 import torch
@@ -52,6 +63,7 @@ from eden.managers import METRIC_TERM_REGISTRY, REWARD_TERM_REGISTRY
 from eden.managers.action_manager import ACTION_TERM_REGISTRY
 from eden.managers.event_manager import EVENT_TERM_REGISTRY
 from eden.managers.event_manager import EventTerm as EventTermBase
+from eden.managers.metric_manager import MetricTerm as MetricTermBase
 from eden.managers.modifiers.observations.noise import GaussianNoise, UniformNoise
 from eden.managers.reward_manager import RewardTerm as RewardTermBase
 from eden.managers.terms.actions.joint_actions import ImplicitPDController, NullJointAction
@@ -60,7 +72,7 @@ from eden.managers.terms.commands.oracle import UniformT3Command
 from eden.managers.terms.curricula.rewards import StageRewardWeightCurriculum
 from eden.managers.terms.events import RandomizeFrictionRatio
 from eden.managers.terms.events.resets import reset_base_state_uniform
-from eden.managers.terms.utils import resolve_link_idx, soft_dof_pos_violation
+from eden.managers.terms.utils import resolve_link_idx, resolve_metric_manager, soft_dof_pos_violation
 from eden.options import ObservationGroupOptions
 from eden.options.entities import BoxOptions, CylinderOptions, SphereOptions
 from eden.options.learning.rsl_rl import (
@@ -163,6 +175,40 @@ _HAND_LINKS = [_EE_LINK] + [
     f"right_hand_{digit}_link"
     for digit in ("thumb_0", "thumb_1", "thumb_2", "index_0", "index_1", "middle_0", "middle_1")
 ]
+#: The two sides of an opposed grasp: the thumb, and the two fingers it closes against.
+_THUMB_LINKS = ["right_hand_thumb_1_link", "right_hand_thumb_2_link"]
+_FINGER_LINKS = [f"right_hand_{digit}_link" for digit in ("index_0", "index_1", "middle_0", "middle_1")]
+#: Where the closing joints head when the hand closes on nothing: the thumb's distal joint closes negative, the
+#: fingers positive. A grasp on the beaker stops them about two thirds of the way.
+_HAND_CLOSED = {
+    "right_hand_thumb_2_joint": -1.2,
+    "right_hand_index_0_joint": 1.2,
+    "right_hand_index_1_joint": 1.2,
+    "right_hand_middle_0_joint": 1.2,
+    "right_hand_middle_1_joint": 1.2,
+}
+
+_WAIST_DOFS = ["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"]
+#: The asset's gains are the motor-inertia heuristic of the whole-body trackers (kp 28.5 on waist roll and pitch,
+#: 14.3 on the arm), which leave balance and load to a policy that drives every joint. Here nothing drives the
+#: waist, and the upper body is an inverted pendulum on it: with the right arm reaching out, the torso sagged 27 deg
+#: in roll and 28 deg in pitch, and the hand could not lift a grasped beaker. A scripted grasp lifted it 10 cm in
+#: 40 of 40 hand poses at these gains and in none at the asset's. The robot takes per-joint gains over the SDK.
+_WAIST_KP, _WAIST_KD = 300.0, 5.0
+_ARM_KP, _ARM_KD = 60.0, 2.0
+
+#: The right arm with the open hand straddling the beaker at its home: wrist z up, palm toward the beaker, the beaker
+#: 11 cm along the fingers and 5 cm out from the palm. Solved by IK for that hand pose; from it a scripted closure
+#: and a 10 cm rise lift the beaker with 0.4 deg of tilt.
+_PREGRASP_ARM = {
+    "right_shoulder_pitch_joint": -0.3348,
+    "right_shoulder_roll_joint": -0.3934,
+    "right_shoulder_yaw_joint": -0.2540,
+    "right_elbow_joint": 0.5495,
+    "right_wrist_roll_joint": 0.2918,
+    "right_wrist_pitch_joint": -0.1135,
+    "right_wrist_yaw_joint": 0.8468,
+}
 
 #: Hand raised behind the bench edge, clear of every place the beaker can be. Elbow 0 is the forearm level with the
 #: upper arm down, and negative bends it up. The hand's collision geoms span x 0.01-0.215 m (the beaker's nearest
@@ -180,26 +226,31 @@ _RIGHT_ARM_READY = {
 }
 
 
-def _ready_dofs_pos() -> dict[str, float]:
-    """The G1Dofs29Dex3 default joint positions with the right arm at :data:`_RIGHT_ARM_READY`.
+def _per_joint(field: str, overrides: dict[str, float]) -> dict[str, float]:
+    """G1Dofs29Dex3's ``field`` with one key per joint, then ``overrides`` on top.
 
-    The asset's ``*_shoulder_pitch_joint``-style keys are split into a ``left_`` and a ``right_`` key first, because
-    a joint matched by two keys is an error and the right arm's keys override exactly those.
+    The asset keys joints by pattern (``*_shoulder_*_joint``), and a joint two keys match is an error, so an override
+    of one joint is only possible once every pattern is resolved to the joints it names.
     """
-    split = {}
-    for key, value in G1Dofs29Dex3.model_fields["default_dofs_pos"].default.items():
-        if key.startswith("*_"):
-            split[f"left_{key[2:]}"] = value
-            split[f"right_{key[2:]}"] = value
-        else:
-            split[key] = value
-    return {**split, **_RIGHT_ARM_READY}
+    patterns = G1Dofs29Dex3.model_fields[field].default
+    per_joint = {}
+    for name in G1Dofs29Dex3.model_fields["dofs_name"].default:
+        matched = [value for pattern, value in patterns.items() if fnmatchcase(name, pattern)]
+        if matched:
+            per_joint[name] = matched[0]
+    return {**per_joint, **overrides}
 
 
 _ROBOT = G1Dofs29Dex3(
     # The MJCF's base is a free joint, so the flag must say so; the weld to ``pelvis_mount`` pins it.
     is_fixed_base=False,
-    default_dofs_pos=_ready_dofs_pos(),
+    default_dofs_pos=_per_joint("default_dofs_pos", _RIGHT_ARM_READY),
+    default_dofs_kp=_per_joint(
+        "default_dofs_kp", {**dict.fromkeys(_WAIST_DOFS, _WAIST_KP), **dict.fromkeys(_ARM_DOFS, _ARM_KP)}
+    ),
+    default_dofs_kd=_per_joint(
+        "default_dofs_kd", {**dict.fromkeys(_WAIST_DOFS, _WAIST_KD), **dict.fromkeys(_ARM_DOFS, _ARM_KD)}
+    ),
     # Nothing else reaches the bench or the beaker, and every pair dropped is collision work saved.
     collision_link_patterns=["right_elbow_link", "right_wrist_.*", "right_hand_.*"],
 )
@@ -361,7 +412,7 @@ class DisplaceRestingObject(EventTermBase):
         resting = (obj_pos[:, 2] - self.rest_z).abs() < self.rest_tolerance
         untouched = torch.norm(grasp - obj_pos, dim=-1) > self.min_hand_distance
         drawn = torch.rand(self.num_envs, device=self.device) < self.probability
-        move = resting & untouched & drawn & self._selected(envs_idx)
+        move = resting & untouched & drawn & _env_mask(envs_idx, self.num_envs, self.device)
         # A bool mask with every row is the setters' sync-free form; an all-False mask writes nothing.
         reset_base_state_uniform(
             self._env,
@@ -373,13 +424,214 @@ class DisplaceRestingObject(EventTermBase):
             yaw_range=self.yaw_range,
         )
 
-    def _selected(self, envs_idx: slice | torch.Tensor | None) -> torch.Tensor:
-        """The envs this fire covers, as a ``(num_envs,)`` bool mask."""
-        if envs_idx is not None and is_env_mask(envs_idx):
-            return envs_idx
-        mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        mask[slice(None) if envs_idx is None else envs_idx] = True
-        return mask
+
+def _env_mask(envs_idx: slice | torch.Tensor | None, num_envs: int, device) -> torch.Tensor:
+    """The envs an event fires for, as a ``(num_envs,)`` bool mask."""
+    if envs_idx is not None and is_env_mask(envs_idx):
+        return envs_idx
+    mask = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    mask[slice(None) if envs_idx is None else envs_idx] = True
+    return mask
+
+
+@EVENT_TERM_REGISTRY.register()
+class StartAtPregrasp(EventTermBase):
+    """Start a share of the episodes with the object already inside the open hand.
+
+    With probability ``probability`` per resetting env, it writes ``dofs_pos`` (joint name -> position) to
+    ``entity_name`` and redraws the object around its default pose (``pos_jitter`` m in x and y, ``yaw_range``). Run
+    it after the events that place the object and the robot (a higher ``priority``), since it overwrites both.
+    Episodes that start at the grasp reach the lift often enough for the policy to find out what it pays.
+    """
+
+    mode: EventMode = EventMode.RESET
+    probability: float = 0.25
+    entity_name: str = "robot"
+    dofs_pos: dict[str, float] = {}
+    object_name: str = "object"
+    pos_jitter: float = 0.01
+    yaw_range: Vec2FType = (-3.14, 3.14)
+
+    def build(self) -> None:
+        entity = self.resolve_entity(self.entity_name)
+        self.resolve_entity(self.object_name)
+        if not self.dofs_pos:
+            raise ValueError(
+                f"{term_subject(self)}: dofs_pos is empty, so there is no pre-grasp pose to start from. Give the "
+                f"arm's joints, e.g. dofs_pos={{'{entity.dofs_name[0]}': 0.0, ...}}."
+            )
+        if not 0.0 <= self.probability <= 1.0:
+            raise ValueError(f"{term_subject(self)}: probability must be in [0, 1], got {self.probability}.")
+        dofs = entity.find_named_dofs(list(self.dofs_pos))
+        self._dofs_idx_local = dofs.dofs_idx_local
+        self._pregrasp = torch.tensor([list(self.dofs_pos.values())], device=self.device)
+
+    def compute(self, envs_idx: slice | torch.Tensor | None = None) -> None:
+        entity = self.resolve_entity(self.entity_name)
+        drawn = torch.rand(self.num_envs, device=self.device) < self.probability
+        start = drawn & _env_mask(envs_idx, self.num_envs, self.device)
+        dofs_pos = entity.get_dofs_pos(dofs_idx_local=self._dofs_idx_local)
+        dofs_pos = torch.where(start.unsqueeze(-1), self._pregrasp, dofs_pos)
+        entity.set_dofs_pos(dofs_pos, dofs_idx_local=self._dofs_idx_local, envs_idx=start)
+        jitter = (-self.pos_jitter, self.pos_jitter)
+        reset_base_state_uniform(
+            self._env,
+            start,
+            entity_name=self.object_name,
+            pos_x_range=jitter,
+            pos_y_range=jitter,
+            pos_z_range=(0.0, 0.0),
+            yaw_range=self.yaw_range,
+        )
+
+
+@METRIC_TERM_REGISTRY.register()
+class OpposedGrasp(MetricTermBase):
+    """1.0 where both sides of the hand press the object: a ``thumb_links`` link and a ``finger_links`` link, each
+    with more than ``force_threshold`` N of contact force from it.
+
+    Read from the contacts between the two entities alone, so the fingers pressing the hand's own palm or the bench
+    do not count, and an object pushed by one side only is not held.
+    """
+
+    entity_name: str = "robot"
+    object_name: str = "object"
+    thumb_links: list[str] = []
+    finger_links: list[str] = []
+    force_threshold: float = 0.5
+
+    def build(self) -> None:
+        entity = self.resolve_entity(self.entity_name)
+        self.resolve_entity(self.object_name)
+        if not self.thumb_links or not self.finger_links:
+            raise ValueError(
+                f"{term_subject(self)}: thumb_links and finger_links must both name links (got {self.thumb_links} and "
+                f"{self.finger_links}); a grasp needs a link on each side, e.g. thumb_links={entity.links_name[-1:]}."
+            )
+        thumb = resolve_link_idx(entity, self.thumb_links, self.device, term=type(self).__name__)
+        fingers = resolve_link_idx(entity, self.finger_links, self.device, term=type(self).__name__)
+        self._links = torch.cat([thumb, fingers])
+        self._n_thumb = len(thumb)
+
+    def compute(self) -> torch.Tensor:
+        entity, obj = self.resolve_entity(self.entity_name), self.resolve_entity(self.object_name)
+        force = entity.get_grouped_contacts(obj, links_a_idx_local=self._links)["force_norm_sum"].sum(dim=-1)
+        thumb = force[:, : self._n_thumb].sum(dim=-1) > self.force_threshold
+        fingers = force[:, self._n_thumb :].sum(dim=-1) > self.force_threshold
+        return (thumb & fingers).float()
+
+
+@REWARD_TERM_REGISTRY.register()
+class GraspClosure(RewardTermBase):
+    """Mean flexion of the hand's closing joints, paid while its grasp point is within ``near_distance`` of the
+    object: what teaches a dexterous hand to close, which no distance reward does.
+
+    Each joint in ``closed_dofs_pos`` (name -> closed position) scores 0 at its default and 1 at the closed position,
+    clipped to [0, 1]. The grasp point is the centroid of ``grasp_links``' collision geoms.
+    """
+
+    entity_name: str = "robot"
+    object_name: str = "object"
+    grasp_links: list[str] = []
+    closed_dofs_pos: dict[str, float] = {}
+    near_distance: float = 0.08
+
+    def build(self) -> None:
+        entity = self.resolve_entity(self.entity_name)
+        self.resolve_entity(self.object_name)
+        if not self.closed_dofs_pos or not self.grasp_links:
+            raise ValueError(
+                f"{term_subject(self)}: closed_dofs_pos and grasp_links must both be set (got {self.closed_dofs_pos} "
+                f"and {self.grasp_links}): the joints that close the hand, and the links whose centroid is its grasp point."
+            )
+        resolve_link_idx(entity, self.grasp_links, self.device, term=type(self).__name__)
+        dofs = entity.find_named_dofs(list(self.closed_dofs_pos))
+        self._dofs_idx_local = dofs.dofs_idx_local
+        self._open = entity.get_default_dofs_pos(dofs)  # (n_envs, n), a copy
+        closed = torch.tensor([list(self.closed_dofs_pos.values())], device=self.device)
+        self._span = closed - self._open
+        if (self._span.abs() < 1e-3).any():
+            raise ValueError(
+                f"{term_subject(self)}: every closed position must differ from the joint's default; "
+                f"closed_dofs_pos={self.closed_dofs_pos}, defaults {self._open[0].tolist()}."
+            )
+
+    def compute(self) -> torch.Tensor:
+        entity = self.resolve_entity(self.entity_name)
+        flexion = ((entity.get_dofs_pos(dofs_idx_local=self._dofs_idx_local) - self._open) / self._span).clamp(0.0, 1.0)
+        grasp = _grasp_point_w(self._env, self.entity_name, self.grasp_links)
+        near = torch.norm(grasp - self.resolve_entity(self.object_name).get_pos(), dim=-1) < self.near_distance
+        return flexion.mean(dim=-1) * near
+
+
+@REWARD_TERM_REGISTRY.register()
+class GraspedLiftHeight(RewardTermBase):
+    """The object's height above ``rest_z``, capped at ``cap``, paid only while the ``grasp_metric`` metric holds.
+
+    Ungated, any upward motion pays, a beaker tipped onto its rim included (its centre rises 1 cm).
+    """
+
+    object_name: str = "object"
+    rest_z: float = 0.0
+    cap: float = 0.25
+    grasp_metric: str = ""
+
+    def build(self) -> None:
+        resolve_metric_manager(self._env, term=type(self).__name__, metric_name=self.grasp_metric)
+        self.resolve_entity(self.object_name)
+
+    def compute(self) -> torch.Tensor:
+        height = (self.resolve_entity(self.object_name).get_pos()[:, 2] - self.rest_z).clamp(0.0, self.cap)
+        return height * self._env.metric_manager.get_value(self.grasp_metric)
+
+
+@REWARD_TERM_REGISTRY.register()
+class LiftedObjectTilt(RewardTermBase):
+    """The ``tilt_metric`` metric, counted only once the object is ``margin`` m above ``rest_z`` (negative weight).
+
+    On the bench a closing hand nudges the beaker; nothing spills until it is off the bench, and a penalty there
+    only teaches the hand not to close.
+    """
+
+    object_name: str = "object"
+    rest_z: float = 0.0
+    margin: float = 0.01
+    tilt_metric: str = ""
+
+    def build(self) -> None:
+        resolve_metric_manager(self._env, term=type(self).__name__, metric_name=self.tilt_metric)
+        self.resolve_entity(self.object_name)
+
+    def compute(self) -> torch.Tensor:
+        lifted = self.resolve_entity(self.object_name).get_pos()[:, 2] > self.rest_z + self.margin
+        return self._env.metric_manager.get_value(self.tilt_metric) * lifted
+
+
+@REWARD_TERM_REGISTRY.register()
+class ContactForceWith(RewardTermBase):
+    """Contact force between ``links_name`` of ``entity_name`` and the ``other_name`` entity, in N, capped at
+    ``max_force`` (negative weight to penalize).
+    """
+
+    entity_name: str = "robot"
+    links_name: list[str] = []
+    other_name: str = ""
+    max_force: float = 30.0
+
+    def build(self) -> None:
+        entity = self.resolve_entity(self.entity_name)
+        self.resolve_entity(self.other_name)
+        if not self.links_name:
+            raise ValueError(
+                f"{term_subject(self)}: links_name is empty, so no contact is measured. Name the links whose contact "
+                f"with '{self.other_name}' counts, e.g. links_name={entity.links_name[-2:]}."
+            )
+        self._links = resolve_link_idx(entity, self.links_name, self.device, term=type(self).__name__)
+
+    def compute(self) -> torch.Tensor:
+        other = self.resolve_entity(self.other_name)
+        contacts = self.resolve_entity(self.entity_name).get_grouped_contacts(other, links_a_idx_local=self._links)
+        return contacts["force_norm_sum"].sum(dim=(1, 2)).clamp(max=self.max_force)
 
 
 # ---------------------------------------------------------------------------
@@ -556,31 +808,51 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
 
     metric_options: MetricManagerOptions = MetricManagerOptions(
         beaker_tilt=MetricTerm.configure(func=object_tilt, params={"object_name": "beaker"}),
+        beaker_grasped=OpposedGrasp.configure(
+            entity_name="robot",
+            object_name="beaker",
+            thumb_links=_THUMB_LINKS,
+            finger_links=_FINGER_LINKS,
+            force_threshold=0.5,
+            contributes_to_success=False,
+        ),
     )
 
+    # The approach terms are worth at most 5 a step, well under a grasp (4 + 2 for closing) and far under a lift
+    # (up to 5 + 5 + 35): in the first version they paid 8.5, and a hand lying open around the beaker's foot
+    # collected 6.8 of it for 2700 iterations without ever closing.
     reward_options: RewardManagerOptions = RewardManagerOptions(
         reaching_object=RewardTerm.configure(
             func=custom_terms.object_ee_distance,
-            weight=5.0,
+            weight=2.0,
             params={**_GRASP, "object_name": "beaker", "std": 0.3},
         ),
         # Sharp, unclamped fine reach: gradient across the last few cm into the grasp.
         reaching_object_fine=RewardTerm.configure(
             func=custom_terms.object_ee_distance,
-            weight=3.0,
+            weight=2.0,
             params={**_GRASP, "object_name": "beaker", "std": 0.05, "clamp_max": 1.0},
         ),
         # The fingertips wrapping the beaker.
         fingertip_to_object=RewardTerm.configure(
             func=dex_fingertip_to_object_reward,
-            weight=2.0,
+            weight=1.0,
             params={**_TIP_TERMS, "sigma": 0.06},
         ),
-        # Dense height reward: any upward beaker motion is rewarded.
-        lift_height=RewardTerm.configure(
-            func=custom_terms.lift_height,
-            weight=15.0,
-            params={"object_name": "beaker", "rest_z": _REST_Z, "cap": 0.25},
+        # Close the hand once it is at the beaker.
+        hand_closure=GraspClosure.configure(
+            weight=2.0,
+            entity_name="robot",
+            object_name="beaker",
+            grasp_links=_TIPS,
+            closed_dofs_pos=_HAND_CLOSED,
+            near_distance=0.08,
+        ),
+        # Thumb and fingers both pressing the beaker.
+        beaker_grasped=rewards.MetricReward.configure(metric_name="beaker_grasped", weight=4.0),
+        # Height above the bench, while grasped.
+        lift_height=GraspedLiftHeight.configure(
+            weight=20.0, object_name="beaker", rest_z=_REST_Z, cap=0.25, grasp_metric="beaker_grasped"
         ),
         lifting_object=RewardTerm.configure(
             func=custom_terms.object_is_lifted,
@@ -605,8 +877,14 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
                 "deadband": 0.02,
             },
         ),
-        # Keep it upright: 0 while it stands, ~0.06 at 20 deg; past 45 deg the episode ends.
-        beaker_upright=rewards.MetricReward.configure(metric_name="beaker_tilt", weight=-20.0),
+        # Keep it upright once it is off the bench: ~0.06 at 20 deg; past 45 deg the episode ends wherever it is.
+        beaker_upright=LiftedObjectTilt.configure(
+            weight=-20.0, object_name="beaker", rest_z=_REST_Z, margin=0.01, tilt_metric="beaker_tilt"
+        ),
+        # The hand pressing on the bench (the first version's policy lay on it): -0.02 per N, at most -0.6.
+        hand_on_bench=ContactForceWith.configure(
+            weight=-0.02, entity_name="robot", links_name=_HAND_LINKS, other_name="bench_top", max_force=30.0
+        ),
         # Smoothness regularizers, ramped in by the curriculum once the grasp and lift are learned.
         action_rate=RewardTerm.configure(func=rewards.action_rate_l2, weight=-0.05),
         arm_joint_vel=NamedDofsVelLimits.configure(entity_name="robot", dofs_name=_ARM_DOFS, max_vel=0.5, weight=-0.01),
@@ -660,6 +938,17 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
             func=events.reset_dofs_by_offset,
             mode=EventMode.RESET,
             params={"entity_name": "robot", "dofs_pos_range": (-0.02, 0.02)},
+        ),
+        # A quarter of the episodes start with the open hand around the beaker at its home (after the two above).
+        pregrasp_start=StartAtPregrasp.configure(
+            priority=1,
+            probability=0.25,
+            entity_name="robot",
+            dofs_pos=_PREGRASP_ARM,
+            object_name="beaker",
+            # The open hand clears the beaker by about 1.5 cm on the palm side.
+            pos_jitter=0.005,
+            yaw_range=(-3.14159, 3.14159),
         ),
         # Stiffen the right hand's contact with the beaker, so a grasp cannot rest on fingers sunk into it.
         stiffen_contact=EventTerm.configure(
@@ -739,5 +1028,5 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
         max_iterations=3000,
         save_interval=50,
         experiment_name="g1_beaker_lift",
-        run_name="v1",
+        run_name="v2",
     )

@@ -153,7 +153,7 @@ The policy is trained to be deployed on the real rig:
 
 `manipulation_g1_beaker_lift` is the dexterous lift on a humanoid at a lab bench: a `G1Dofs29Dex3` picks a 250 mL
 beaker (a 7 × 9.5 cm cylinder, 0.12–0.30 kg) off a 0.85 m bench with its right Dex3 hand, keeps it upright, and holds
-it at a goal 10–25 cm above the bench. It reuses the dexterous lift's reward structure and curricula.
+it at a goal 10–25 cm above the bench. It reuses the dexterous lift's goal tracking and curricula.
 
 ```bash
 eden train --task manipulation_g1_beaker_lift
@@ -164,11 +164,19 @@ eden train --task manipulation_g1_beaker_lift
   deltas accumulate on the last joint target so the arm holds its pose without gravity compensation, and a joint PD
   over the seven right Dex3 joints. Every other joint is held at its default, and only the right forearm and hand
   collide.
+- **A stiff waist and arm.** The G1's asset gains are the whole-body trackers' (waist roll and pitch kp 28.5, arm
+  14.3). With nothing driving the waist, the torso sags 27–28° under the reaching arm and no scripted grasp lifts the
+  beaker; at waist kp 300 and arm kp 60, every one of 40 does. A deployment sets the same gains.
 - **Reach decides the layout.** With the pelvis and waist fixed the palm reaches about 35–45 cm forward, so the bench
   is a slab with knee room under it, 20 cm from the pelvis, and the beaker starts anywhere in 12 × 30 cm in front of
-  the right shoulder. The arm starts raised behind the bench edge, clear of the beaker.
-- **The beaker must stay upright.** An `object_tilt` metric (`1 − cos` of the tilt) is penalized and ends the episode
-  past 45°.
+  the right shoulder. The arm starts raised behind the bench edge, clear of the beaker, and a quarter of the episodes
+  start instead with the open hand around the beaker (`StartAtPregrasp`).
+- **A grasp is contact.** `OpposedGrasp` is a metric that holds while the thumb and a finger both press the beaker;
+  it is rewarded and gates the lift-height reward. `GraspClosure` pays the fingers for closing at the beaker. The
+  distance-based approach terms are worth at most 5 a step against up to 45 for a grasp and lift: at full weight, a
+  first version's policy lay the open hand around the beaker's foot and collected them without ever closing.
+- **The beaker must stay upright.** An `object_tilt` metric (`1 − cos` of the tilt) is penalized once the beaker is
+  off the bench and ends the episode past 45° wherever it is.
 - **The beaker is moved before the grasp.** `DisplaceRestingObject` teleports a resting beaker the hand has not
   reached yet to a fresh spot, at random intervals, so the policy re-targets a beaker someone moved.
 - **State-based, deployment-shaped observations.** The policy sees the arm and hand encoders, forward kinematics of

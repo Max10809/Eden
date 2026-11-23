@@ -1,22 +1,28 @@
 """Tests for ``eden.tasks.manipulation.g1_beaker_lift.config``: what the policy observes, the welded pelvis, the arm
-holding its commanded pose, the beaker's tilt, the joint-subset penalties and the beaker displacement, on the built
-task.
+holding its commanded pose, the stiff waist, the pre-grasp start, the grasp-gated lift reward, a scripted grasp and
+lift through the task's own actions, the beaker's tilt, the joint-subset penalties and the beaker displacement, on
+the built task.
 """
 
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 
 import pytest
 import torch
 
 from eden.tasks import TASK_REGISTRY
 from eden.tasks.manipulation.g1_beaker_lift.config import (
+    _ARM_DOFS,
     _BEAKER_HOME,
+    _HAND_CLOSED,
     _PELVIS_POS,
     _PLACE_X,
     _PLACE_Y,
+    _PREGRASP_ARM,
     _REST_Z,
+    _WAIST_DOFS,
     ManipulationG1BeakerLiftConfig,
     object_tilt,
 )
@@ -52,14 +58,32 @@ def test_the_policy_observes_only_what_the_robot_measures_and_the_critic_also_se
 
 @pytest.fixture(scope="module")
 def env():
+    """The task, deterministic: no pre-grasp starts unless a test asks (``_pregrasp``), nominal hand and beaker."""
     config = TASK_REGISTRY.build("manipulation_g1_beaker_lift").with_overrides_from_dict(
         {"env_options": {"num_envs": NUM_ENVS}}
     )
+    config.event_options.pregrasp_start.probability = 0.0
+    config.event_options.hand_friction.friction_range = (1.5, 1.5)
+    config.event_options.beaker_mass.mass_shift_range = (0.0, 0.0)
     return build_env(config, reset=True)
 
 
 def _zero_action(env) -> torch.Tensor:
     return torch.zeros(env.num_envs, env.action_manager.total_action_dim, device=env.device)
+
+
+@contextmanager
+def _pregrasp(env):
+    """Every reset inside starts at the pre-grasp pose; the env is reset back to the normal start afterwards."""
+    start = env.event_manager.get_term("pregrasp_start")
+    probability = start.probability
+    start.probability = 1.0
+    try:
+        env.reset()
+        yield
+    finally:
+        start.probability = probability
+        env.reset()
 
 
 def _set_beaker(env, pos: tuple[float, float, float], quat: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)):
@@ -87,6 +111,69 @@ def test_a_zero_ik_action_holds_the_arm_target_instead_of_following_its_sag(env)
     for _ in range(10):
         env.step(_zero_action(env))
     torch.testing.assert_close(arm_ik.processed_action, first_target, atol=1e-6, rtol=0)
+
+
+@pytest.mark.requires_genesis
+def test_pregrasp_start_puts_the_open_hand_around_the_beaker_at_home(env):
+    robot = env.entities["robot"]
+    arm = robot.find_named_dofs(list(_PREGRASP_ARM))
+    with _pregrasp(env):
+        torch.testing.assert_close(
+            robot.get_dofs_pos(dofs_idx_local=arm.dofs_idx_local),
+            torch.tensor([list(_PREGRASP_ARM.values())] * NUM_ENVS),
+            atol=1e-4,
+            rtol=0,
+        )
+        offset = env.entities["beaker"].get_pos() - torch.tensor(_BEAKER_HOME)
+        assert (offset[:, :2].abs() <= 0.005 + 1e-5).all()
+        env.step(_zero_action(env))
+        # The open hand does not hold it: an opposed grasp needs the hand to close.
+        torch.testing.assert_close(env.metric_manager.get_value("beaker_grasped"), torch.zeros(NUM_ENVS))
+
+
+@pytest.mark.requires_genesis
+def test_the_stiff_waist_holds_the_torso_up_with_the_arm_reaching_out(env):
+    """At the asset's waist gains the torso sagged 0.48 rad in roll and in pitch under this arm pose."""
+    robot = env.entities["robot"]
+    waist = robot.find_named_dofs(_WAIST_DOFS)
+    with _pregrasp(env):
+        for _ in range(20):
+            env.step(_zero_action(env))
+        assert robot.get_dofs_pos(dofs_idx_local=waist.dofs_idx_local).abs().max() < 0.05
+
+
+@pytest.mark.requires_genesis
+def test_lift_height_pays_nothing_for_a_beaker_off_the_bench_that_the_hand_does_not_hold(env):
+    env.reset()
+    # Away from home, where 5 cm up reaches the raised hand's fingers.
+    _set_beaker(env, (0.36, -0.28, _REST_Z + 0.05))
+    env.step(_zero_action(env))
+    assert (env.entities["beaker"].get_pos()[:, 2] > _REST_Z + 0.03).all()
+    torch.testing.assert_close(env.reward_manager.get_term("lift_height").compute(), torch.zeros(NUM_ENVS))
+    env.reset()
+
+
+@pytest.mark.requires_genesis
+def test_closing_and_raising_the_hand_from_the_pregrasp_lifts_the_beaker_held_and_upright(env):
+    """The task's own actions can do it: a hand closure over 15 steps, then +z on the palm's IK."""
+    hand = env.action_manager.get_term("hand")
+    closed = torch.tensor([[_HAND_CLOSED.get(name, 0.0) for name in hand.dofs_name]])
+    hand_action = closed / hand.effective_scale
+    action = _zero_action(env)
+    columns = {name: i for i, name in enumerate(env.action_manager.active_terms)}
+    assert list(columns) == ["arm_ik", "hand", "hold_body"]  # arm_ik's 6 columns, then the hand's 7
+    with _pregrasp(env):
+        for step in range(30):
+            action[:, 6:13] = hand_action * min(1.0, (step + 1) / 15)
+            env.step(action)
+        torch.testing.assert_close(env.metric_manager.get_value("beaker_grasped"), torch.ones(NUM_ENVS))
+        action[:, 2] = 0.4  # +z, in the IK's (x, y, z, rx, ry, rz)
+        for _ in range(40):
+            env.step(action)
+        beaker = env.entities["beaker"]
+        assert (beaker.get_pos()[:, 2] - _REST_Z > 0.08).all()
+        assert (object_tilt(env, object_name="beaker") < 1.0 - math.cos(math.radians(15.0))).all()
+        torch.testing.assert_close(env.metric_manager.get_value("beaker_grasped"), torch.ones(NUM_ENVS))
 
 
 @pytest.mark.requires_genesis
