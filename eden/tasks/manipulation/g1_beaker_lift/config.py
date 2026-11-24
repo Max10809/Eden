@@ -31,6 +31,10 @@ stiffening, on a :class:`~eden.options.robots.G1Dofs29Dex3` instead of a table-m
   good without ever closing. Now :class:`OpposedGrasp` (thumb and fingers both pressing the beaker) is a rewarded
   metric that gates the lift-height reward, :class:`GraspClosure` pays the fingers for closing at the beaker, the
   approach terms are worth at most 5 a step against up to 45 for a grasp and lift, and pressing the bench costs.
+* **The beaker does not creep in the grasp, and it is carried slowly.** Friction constraints are 100x stiffer than
+  the normal ones (``impratio``): at the default the soft friction let a held beaker turn in the hand at 4 deg/s,
+  and the policy chased it with its wrist. The palm moves at most about 0.17 m/s (the IK scales and a 1.5 rad/s
+  joint clamp; the first versions grabbed the beaker 0.24 s in), and the carried beaker's angular velocity costs.
 * **A quarter of the episodes start at the grasp.** :class:`StartAtPregrasp` puts the open hand around the beaker
   at its home (a pose from which a scripted closure lifts it), so the lift is found early.
 * **The beaker must stay upright.** :func:`object_tilt` (``1 - cos`` of the beaker's tilt) is a metric that a
@@ -608,6 +612,25 @@ class LiftedObjectTilt(RewardTermBase):
 
 
 @REWARD_TERM_REGISTRY.register()
+class LiftedObjectAngVel(RewardTermBase):
+    """The object's squared angular speed (rad/s), counted only once it is ``margin`` m above ``rest_z`` (negative
+    weight): a carried beaker that swings or spins slops its contents however upright it ends up.
+    """
+
+    object_name: str = "object"
+    rest_z: float = 0.0
+    margin: float = 0.01
+
+    def build(self) -> None:
+        self.resolve_entity(self.object_name)
+
+    def compute(self) -> torch.Tensor:
+        obj = self.resolve_entity(self.object_name)
+        lifted = obj.get_pos()[:, 2] > self.rest_z + self.margin
+        return obj.get_ang().square().sum(dim=-1) * lifted
+
+
+@REWARD_TERM_REGISTRY.register()
 class ContactForceWith(RewardTermBase):
     """Contact force between ``links_name`` of ``entity_name`` and the ``other_name`` entity, in N, capped at
     ``max_force`` (negative weight to penalize).
@@ -758,6 +781,12 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
         enable_multi_contact=True,
         # RandomizeMassShift writes a per-env beaker mass.
         batch_links_info=True,
+        # Friction constraints 100x stiffer than the normal ones. At Genesis' pyramidal-cone default (1) the soft
+        # friction let a held beaker creep round in the grasp at a steady 4 deg/s, 21 deg in 6 s with the arm still
+        # and 46 N of grip, and the policy learned to chase it with the wrist; at 50 it turns 0.8 deg, at 200 0.1 deg.
+        # The noslip pass stops it as well (0.9 deg at 5 iterations) but cuts training throughput 4.5x; torsional
+        # friction, the elliptic cone or impratio 10 only slow it.
+        impratio=100.0,
     )
 
     scene_options: SceneOptions = _bench_scene()
@@ -769,16 +798,18 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
 
     action_options: ActionManagerOptions = ActionManagerOptions(
         # 6-DOF differential IK at the palm centre over the seven right-arm joints, well damped, with a per-step
-        # joint clamp, accumulated on the last target so the unassisted arm holds its pose.
+        # joint clamp, accumulated on the last target so the unassisted arm holds its pose. The clamp is the speed
+        # limit: 0.03 rad a 50 Hz step is 1.5 rad/s, so the reach from the raised hand takes over a second. At the
+        # dex-lift values (0.2 rad, 5 cm a step) the policy grabbed the beaker 0.24 s into the episode.
         arm_ik=AccumulatedDifferentialIKController.configure(
             entity_name="robot",
             dofs_name=_ARM_DOFS,
             ee_link_name=_EE_LINK,
             ee_local_pos=_PALM_IN_WRIST,
-            position_scale=0.05,
-            orientation_scale=0.10,
+            position_scale=0.02,
+            orientation_scale=0.05,
             damping=0.1,
-            max_dq=0.2,
+            max_dq=0.03,
         ),
         # Joint PD on the right Dex3 around its open default; one action unit is half of each joint's range, so the
         # fingers reach closed within the policy's first few standard deviations.
@@ -881,6 +912,8 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
         beaker_upright=LiftedObjectTilt.configure(
             weight=-20.0, object_name="beaker", rest_z=_REST_Z, margin=0.01, tilt_metric="beaker_tilt"
         ),
+        # Carry it smoothly: the beaker's angular velocity squared, off the bench (1 rad/s costs 0.5 a step).
+        beaker_ang_vel=LiftedObjectAngVel.configure(weight=-0.5, object_name="beaker", rest_z=_REST_Z, margin=0.01),
         # The hand pressing on the bench (the first version's policy lay on it): -0.02 per N, at most -0.6.
         hand_on_bench=ContactForceWith.configure(
             weight=-0.02, entity_name="robot", links_name=_HAND_LINKS, other_name="bench_top", max_force=30.0
@@ -1028,5 +1061,5 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
         max_iterations=3000,
         save_interval=50,
         experiment_name="g1_beaker_lift",
-        run_name="v2",
+        run_name="v3",
     )

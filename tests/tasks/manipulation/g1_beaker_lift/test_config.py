@@ -14,7 +14,6 @@ import torch
 
 from eden.tasks import TASK_REGISTRY
 from eden.tasks.manipulation.g1_beaker_lift.config import (
-    _ARM_DOFS,
     _BEAKER_HOME,
     _HAND_CLOSED,
     _PELVIS_POS,
@@ -26,6 +25,7 @@ from eden.tasks.manipulation.g1_beaker_lift.config import (
     ManipulationG1BeakerLiftConfig,
     object_tilt,
 )
+from eden.utils.geom import axis_angle_from_quat, inv_quat, quat_mul
 from tests.support.envs import build_env
 
 NUM_ENVS = 2
@@ -153,9 +153,20 @@ def test_lift_height_pays_nothing_for_a_beaker_off_the_bench_that_the_hand_does_
     env.reset()
 
 
+def _beaker_in_hand(env) -> torch.Tensor:
+    """The beaker's orientation in the palm (wrist-yaw link) frame, wxyz."""
+    robot = env.entities["robot"]
+    _, wrist = robot.find_named_links_idx_local(["right_wrist_yaw_link"], preserve_order=True)
+    return quat_mul(inv_quat(robot.get_links_quat(ls_idx_local=wrist)[:, 0]), env.entities["beaker"].get_quat())
+
+
 @pytest.mark.requires_genesis
-def test_closing_and_raising_the_hand_from_the_pregrasp_lifts_the_beaker_held_and_upright(env):
-    """The task's own actions can do it: a hand closure over 15 steps, then +z on the palm's IK."""
+def test_closing_and_raising_the_hand_from_the_pregrasp_lifts_the_beaker_and_holds_it_without_creep(env):
+    """The task's own actions can do it: a hand closure over 15 steps, then full +z on the palm's IK.
+
+    Held still afterwards, the beaker must not turn in the hand: at the default ``impratio`` the soft friction let
+    it creep round at about 4 deg/s.
+    """
     hand = env.action_manager.get_term("hand")
     closed = torch.tensor([[_HAND_CLOSED.get(name, 0.0) for name in hand.dofs_name]])
     hand_action = closed / hand.effective_scale
@@ -167,13 +178,23 @@ def test_closing_and_raising_the_hand_from_the_pregrasp_lifts_the_beaker_held_an
             action[:, 6:13] = hand_action * min(1.0, (step + 1) / 15)
             env.step(action)
         torch.testing.assert_close(env.metric_manager.get_value("beaker_grasped"), torch.ones(NUM_ENVS))
-        action[:, 2] = 0.4  # +z, in the IK's (x, y, z, rx, ry, rz)
-        for _ in range(40):
+        action[:, 2] = 1.0  # full +z, in the IK's (x, y, z, rx, ry, rz)
+        grasped_steps = torch.zeros(NUM_ENVS)
+        for _ in range(60):
             env.step(action)
+            grasped_steps += env.metric_manager.get_value("beaker_grasped")
         beaker = env.entities["beaker"]
         assert (beaker.get_pos()[:, 2] - _REST_Z > 0.08).all()
         assert (object_tilt(env, object_name="beaker") < 1.0 - math.cos(math.radians(15.0))).all()
-        torch.testing.assert_close(env.metric_manager.get_value("beaker_grasped"), torch.ones(NUM_ENVS))
+        # Held through the raise. Not on every single step: the thumb's contact hops between its two phalanges.
+        assert (grasped_steps / 60 > 0.9).all()
+
+        action[:, 2] = 0.0
+        before = _beaker_in_hand(env)
+        for _ in range(100):  # 2 s
+            env.step(action)
+        turned = axis_angle_from_quat(quat_mul(_beaker_in_hand(env), inv_quat(before))).norm(dim=-1)
+        assert (torch.rad2deg(turned) < 1.0).all()
 
 
 @pytest.mark.requires_genesis

@@ -177,6 +177,11 @@ eden train --task manipulation_g1_beaker_lift
   first version's policy lay the open hand around the beaker's foot and collected them without ever closing.
 - **The beaker must stay upright.** An `object_tilt` metric (`1 − cos` of the tilt) is penalized once the beaker is
   off the bench and ends the episode past 45° wherever it is.
+- **No creep, slow carrying.** At Genesis' default `impratio` (1, with the pyramidal friction cone) the soft
+  friction constraints let a held beaker turn in the hand at about 4°/s under a steady 46 N grip, and a policy
+  learns to chase it with its wrist; the task sets `impratio=100`, which stops it (0.3° in 6 s). The noslip solver
+  stops it too but cuts training throughput 4.5×. The palm moves at most about 0.17 m/s, and the carried beaker's
+  angular velocity is penalized.
 - **The beaker is moved before the grasp.** `DisplaceRestingObject` teleports a resting beaker the hand has not
   reached yet to a fresh spot, at random intervals, so the policy re-targets a beaker someone moved.
 - **State-based, deployment-shaped observations.** The policy sees the arm and hand encoders, forward kinematics of
