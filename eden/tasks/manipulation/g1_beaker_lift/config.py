@@ -31,15 +31,24 @@ stiffening, on a :class:`~eden.options.robots.G1Dofs29Dex3` instead of a table-m
   good without ever closing. Now :class:`OpposedGrasp` (thumb and fingers both pressing the beaker) is a rewarded
   metric that gates the lift-height reward, :class:`GraspClosure` pays the fingers for closing at the beaker, the
   approach terms are worth at most 5 a step against up to 45 for a grasp and lift, and pressing the bench costs.
-* **The beaker does not creep in the grasp, and it is carried slowly.** Friction constraints are 100x stiffer than
+* **The beaker barely creeps in the grasp, and it is carried slowly.** Friction constraints are 10x stiffer than
   the normal ones (``impratio``): at the default the soft friction let a held beaker turn in the hand at 4 deg/s,
-  and the policy chased it with its wrist. The palm moves at most about 0.17 m/s (the IK scales and a 1.5 rad/s
-  joint clamp; the first versions grabbed the beaker 0.24 s in), and the carried beaker's angular velocity costs.
+  and the policy chased it with its wrist; at 10 it turns 0.45 deg/s. The palm moves at most about 0.17 m/s (the
+  IK scales and a 1.5 rad/s joint clamp; the first versions grabbed the beaker 0.24 s in), and the held beaker's
+  angular velocity costs.
+* **The contact solver's blow-ups stay out of the returns.** A hand striking the beaker can make the solver fling
+  the beaker and the arm (stiffer friction makes it worse: at ``impratio=100`` arm joints reached 7000 rad/s). An
+  episode whose beaker is flung (past 3 m/s or 50 rad/s) ends, and the beaker-spin and arm-speed costs are capped:
+  uncapped, the squares of those speeds took the third version's value loss to 3e18 and stalled its training.
 * **A quarter of the episodes start at the grasp.** :class:`StartAtPregrasp` puts the open hand around the beaker
   at its home (a pose from which a scripted closure lifts it), so the lift is found early.
+* **Lift is clearance.** The lift reward pays how far the beaker's bottom clears the bench
+  (:func:`cylinder_clearance`). Paid for its centre's height, the third version's policy gripped the beaker, tipped
+  it 20 deg onto its rim, which raises the centre 0.9 cm, and held it there all episode.
 * **The beaker must stay upright.** :func:`object_tilt` (``1 - cos`` of the beaker's tilt) is a metric that a
-  penalty reads once the beaker is off the bench (on it, the penalty only taught the hand not to close) and that
-  ends the episode past 45 degrees wherever it is: a tipped beaker has spilled.
+  penalty reads once the beaker is gripped or off the bench (before, the penalty only taught the hand not to
+  close; gated on the centre's height, it missed the tip on the rim) and that ends the episode past 45 degrees
+  wherever it is: a tipped beaker has spilled.
 * **The beaker is moved before it is grasped.** At random intervals :class:`DisplaceRestingObject` teleports the
   beaker to a fresh spot, but only while it rests on the bench and the hand is not at it, so the policy learns to
   re-target a beaker someone moved.
@@ -63,7 +72,7 @@ from genesis.typing import Vec2FType
 import eden as en
 from eden import EventMode, events, observations, rewards, terminations
 from eden.constants import MetricDirection, ReferenceSource
-from eden.managers import METRIC_TERM_REGISTRY, REWARD_TERM_REGISTRY
+from eden.managers import METRIC_TERM_REGISTRY, REWARD_TERM_REGISTRY, TERMINATION_TERM_REGISTRY
 from eden.managers.action_manager import ACTION_TERM_REGISTRY
 from eden.managers.event_manager import EVENT_TERM_REGISTRY
 from eden.managers.event_manager import EventTerm as EventTermBase
@@ -276,6 +285,35 @@ def object_tilt(env: EnvBase, *, object_name: str) -> torch.Tensor:
     return 2.0 * (quat[:, 1].square() + quat[:, 2].square())
 
 
+@METRIC_TERM_REGISTRY.register(direction=MetricDirection.HIB, contributes_to_success=False)
+def cylinder_clearance(
+    env: EnvBase, *, object_name: str, radius: float, height: float, support_z: float
+) -> torch.Tensor:
+    """How far the lowest point of a cylinder (its axis along its local z) is above ``support_z``, in m.
+
+    Tilted by ``theta``, that point is ``height / 2 * |cos theta| + radius * sin theta`` below the centre. So a
+    beaker tipped onto its rim on the bench reads 0, where its centre has risen: 0.9 cm at 20 deg, 1.15 cm at most
+    (at 36 deg).
+    """
+    entity = env.get_entity(object_name)
+    quat = entity.get_quat()
+    cos_tilt = 1.0 - 2.0 * (quat[:, 1].square() + quat[:, 2].square())
+    sin_tilt = (1.0 - cos_tilt.square()).clamp(min=0.0).sqrt()
+    return entity.get_pos()[:, 2] - height / 2 * cos_tilt.abs() - radius * sin_tilt - support_z
+
+
+@TERMINATION_TERM_REGISTRY.register()
+def object_ejected(env: EnvBase, *, object_name: str, max_lin_vel: float, max_ang_vel: float) -> torch.Tensor:
+    """The object moves faster than ``max_lin_vel`` m/s or spins faster than ``max_ang_vel`` rad/s.
+
+    No hand carries or knocks a beaker that fast: a hand striking it lets the contact solver fling it (to 16 m/s and
+    490 rad/s in 4096 envs of random actions, and 129 m/s at ``impratio=100``), and what follows is not physics to
+    learn from.
+    """
+    entity = env.get_entity(object_name)
+    return (entity.get_vel().norm(dim=-1) > max_lin_vel) | (entity.get_ang().norm(dim=-1) > max_ang_vel)
+
+
 @REWARD_TERM_REGISTRY.register()
 class NamedDofsPosLimits(RewardTermBase):
     """Soft-limit violation summed over ``dofs_name`` alone.
@@ -305,14 +343,18 @@ class NamedDofsPosLimits(RewardTermBase):
 
 @REWARD_TERM_REGISTRY.register()
 class NamedDofsVelLimits(RewardTermBase):
-    """Quadratic hinge on ``|joint velocity| - max_vel`` over ``dofs_name`` alone (negative weight to penalize).
+    """Quadratic hinge on ``|joint velocity| - max_vel`` over ``dofs_name`` alone, each speed capped at ``cap``
+    (negative weight to penalize).
 
-    ``dofs_vel_limits`` over the whole G1 would also slow the Dex3 fingers, which close faster than an arm moves.
+    ``dofs_vel_limits`` over the whole G1 would also slow the Dex3 fingers, which close faster than an arm moves. The
+    cap is above anything the arm does (12 rad/s under a policy's exploration noise): faster is a contact-solver
+    blow-up, whose square would swamp the returns.
     """
 
     entity_name: str = "robot"
     dofs_name: list[str] = []
     max_vel: float = 0.5
+    cap: float = float("inf")
 
     def build(self) -> None:
         entity = self.resolve_entity(self.entity_name)
@@ -321,13 +363,15 @@ class NamedDofsVelLimits(RewardTermBase):
                 f"{term_subject(self)}: dofs_name is empty, so there is nothing to penalize. Name the joints, e.g. "
                 f"dofs_name={list(entity.dofs_name[:2])}; for every joint of the entity use dofs_vel_limits."
             )
-        if self.max_vel <= 0.0:
-            raise ValueError(f"{term_subject(self)}: max_vel must be > 0 rad/s, got {self.max_vel}.")
+        if not 0.0 < self.max_vel < self.cap:
+            raise ValueError(
+                f"{term_subject(self)}: need 0 < max_vel < cap rad/s, got max_vel={self.max_vel}, cap={self.cap}."
+            )
         self._dofs_idx_local = entity.find_named_dofs(self.dofs_name).dofs_idx_local
 
     def compute(self) -> torch.Tensor:
         dofs_vel = self.resolve_entity(self.entity_name).get_dofs_vel(dofs_idx_local=self._dofs_idx_local)
-        return (dofs_vel.abs() - self.max_vel).clamp_min(0.0).square().sum(dim=-1)
+        return (dofs_vel.abs().clamp(max=self.cap) - self.max_vel).clamp_min(0.0).square().sum(dim=-1)
 
 
 @ACTION_TERM_REGISTRY.register()
@@ -570,64 +614,86 @@ class GraspClosure(RewardTermBase):
 
 @REWARD_TERM_REGISTRY.register()
 class GraspedLiftHeight(RewardTermBase):
-    """The object's height above ``rest_z``, capped at ``cap``, paid only while the ``grasp_metric`` metric holds.
+    """The ``height_metric`` metric (how far the object clears its support), clipped to [0, ``cap``], paid only while
+    the ``grasp_metric`` metric holds.
 
-    Ungated, any upward motion pays, a beaker tipped onto its rim included (its centre rises 1 cm).
+    Ungated, any upward motion pays. Gated, but read off the object's centre, it paid the third version's policy for
+    gripping the beaker and tipping it 20 deg onto its rim (the centre rises 0.9 cm): it held it there all episode and
+    never lifted. A :func:`cylinder_clearance` is 0 on the rim.
     """
 
-    object_name: str = "object"
-    rest_z: float = 0.0
-    cap: float = 0.25
+    height_metric: str = ""
     grasp_metric: str = ""
+    cap: float = 0.25
 
     def build(self) -> None:
-        resolve_metric_manager(self._env, term=type(self).__name__, metric_name=self.grasp_metric)
-        self.resolve_entity(self.object_name)
+        for name in (self.height_metric, self.grasp_metric):
+            resolve_metric_manager(self._env, term=type(self).__name__, metric_name=name)
 
     def compute(self) -> torch.Tensor:
-        height = (self.resolve_entity(self.object_name).get_pos()[:, 2] - self.rest_z).clamp(0.0, self.cap)
-        return height * self._env.metric_manager.get_value(self.grasp_metric)
+        metrics = self._env.metric_manager
+        return metrics.get_value(self.height_metric).clamp(0.0, self.cap) * metrics.get_value(self.grasp_metric)
+
+
+def _held(env: EnvBase, *, clearance_metric: str, grasp_metric: str, margin: float) -> torch.Tensor:
+    """Gripped, or clear of the support by more than ``margin`` (in flight, or carried in a grip the metric missed)."""
+    metrics = env.metric_manager
+    return (metrics.get_value(grasp_metric) > 0.5) | (metrics.get_value(clearance_metric) > margin)
 
 
 @REWARD_TERM_REGISTRY.register()
-class LiftedObjectTilt(RewardTermBase):
-    """The ``tilt_metric`` metric, counted only once the object is ``margin`` m above ``rest_z`` (negative weight).
+class HeldObjectTilt(RewardTermBase):
+    """The ``tilt_metric`` metric while the object is held: gripped (``grasp_metric``) or more than ``margin`` m clear
+    of its support (``clearance_metric``). Negative weight.
 
-    On the bench a closing hand nudges the beaker; nothing spills until it is off the bench, and a penalty there
-    only teaches the hand not to close.
+    Not before: a closing hand nudges the beaker, and a penalty on that only taught the hand not to close. Not only
+    off the bench either: gated on the beaker's height, a beaker gripped and tipped on its rim cost nothing.
     """
 
-    object_name: str = "object"
-    rest_z: float = 0.0
-    margin: float = 0.01
     tilt_metric: str = ""
-
-    def build(self) -> None:
-        resolve_metric_manager(self._env, term=type(self).__name__, metric_name=self.tilt_metric)
-        self.resolve_entity(self.object_name)
-
-    def compute(self) -> torch.Tensor:
-        lifted = self.resolve_entity(self.object_name).get_pos()[:, 2] > self.rest_z + self.margin
-        return self._env.metric_manager.get_value(self.tilt_metric) * lifted
-
-
-@REWARD_TERM_REGISTRY.register()
-class LiftedObjectAngVel(RewardTermBase):
-    """The object's squared angular speed (rad/s), counted only once it is ``margin`` m above ``rest_z`` (negative
-    weight): a carried beaker that swings or spins slops its contents however upright it ends up.
-    """
-
-    object_name: str = "object"
-    rest_z: float = 0.0
+    clearance_metric: str = ""
+    grasp_metric: str = ""
     margin: float = 0.01
 
     def build(self) -> None:
-        self.resolve_entity(self.object_name)
+        for name in (self.tilt_metric, self.clearance_metric, self.grasp_metric):
+            resolve_metric_manager(self._env, term=type(self).__name__, metric_name=name)
 
     def compute(self) -> torch.Tensor:
-        obj = self.resolve_entity(self.object_name)
-        lifted = obj.get_pos()[:, 2] > self.rest_z + self.margin
-        return obj.get_ang().square().sum(dim=-1) * lifted
+        held = _held(
+            self._env, clearance_metric=self.clearance_metric, grasp_metric=self.grasp_metric, margin=self.margin
+        )
+        return self._env.metric_manager.get_value(self.tilt_metric) * held
+
+
+@REWARD_TERM_REGISTRY.register()
+class HeldObjectAngVel(RewardTermBase):
+    """The object's angular speed squared, with the speed capped at ``max_ang_vel`` rad/s, while it is held as
+    :class:`HeldObjectTilt` gates it (negative weight): a carried beaker that swings or spins slops its contents
+    however upright it ends up.
+
+    The cap is what keeps the returns finite. A hand striking the beaker lets the contact solver fling it at up to
+    thousands of rad/s, and uncapped, the third version's returns took the square of that: its value loss reached
+    3e18, and the adaptive schedule held the learning rate at its floor for 800 iterations.
+    """
+
+    object_name: str = "object"
+    clearance_metric: str = ""
+    grasp_metric: str = ""
+    margin: float = 0.01
+    max_ang_vel: float = 3.0
+
+    def build(self) -> None:
+        self.resolve_entity(self.object_name)
+        for name in (self.clearance_metric, self.grasp_metric):
+            resolve_metric_manager(self._env, term=type(self).__name__, metric_name=name)
+
+    def compute(self) -> torch.Tensor:
+        held = _held(
+            self._env, clearance_metric=self.clearance_metric, grasp_metric=self.grasp_metric, margin=self.margin
+        )
+        speed = self.resolve_entity(self.object_name).get_ang().norm(dim=-1).clamp(max=self.max_ang_vel)
+        return speed.square() * held
 
 
 @REWARD_TERM_REGISTRY.register()
@@ -781,12 +847,13 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
         enable_multi_contact=True,
         # RandomizeMassShift writes a per-env beaker mass.
         batch_links_info=True,
-        # Friction constraints 100x stiffer than the normal ones. At Genesis' pyramidal-cone default (1) the soft
-        # friction let a held beaker creep round in the grasp at a steady 4 deg/s, 21 deg in 6 s with the arm still
-        # and 46 N of grip, and the policy learned to chase it with the wrist; at 50 it turns 0.8 deg, at 200 0.1 deg.
-        # The noslip pass stops it as well (0.9 deg at 5 iterations) but cuts training throughput 4.5x; torsional
-        # friction, the elliptic cone or impratio 10 only slow it.
-        impratio=100.0,
+        # Friction constraints 10x stiffer than the normal ones. At Genesis' pyramidal-cone default (1) the soft
+        # friction let a held beaker creep round in the grasp at a steady 3.5-4 deg/s with the arm still and 46 N of
+        # grip, and the policy learned to chase it with the wrist; at 10 it turns 0.45 deg/s, at 100 0.06 deg/s. But
+        # 100 lets a hand striking the beaker make the contact solver fling the arm too: under an early policy's
+        # exploration, arm joints reached 7000 rad/s at 100, 140 at 10 and 37 at 1, and the third version's value
+        # loss reached 3e18. The noslip pass stops the creep as well but cuts training throughput 4.5x.
+        impratio=10.0,
     )
 
     scene_options: SceneOptions = _bench_scene()
@@ -839,6 +906,16 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
 
     metric_options: MetricManagerOptions = MetricManagerOptions(
         beaker_tilt=MetricTerm.configure(func=object_tilt, params={"object_name": "beaker"}),
+        # The beaker's bottom above the bench top: 0 resting, and 0 tipped onto its rim.
+        beaker_clearance=MetricTerm.configure(
+            func=cylinder_clearance,
+            params={
+                "object_name": "beaker",
+                "radius": _BEAKER_RADIUS,
+                "height": _BEAKER_HEIGHT,
+                "support_z": _BENCH_TOP,
+            },
+        ),
         beaker_grasped=OpposedGrasp.configure(
             entity_name="robot",
             object_name="beaker",
@@ -881,10 +958,11 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
         ),
         # Thumb and fingers both pressing the beaker.
         beaker_grasped=rewards.MetricReward.configure(metric_name="beaker_grasped", weight=4.0),
-        # Height above the bench, while grasped.
+        # How far the beaker's bottom clears the bench, while grasped.
         lift_height=GraspedLiftHeight.configure(
-            weight=20.0, object_name="beaker", rest_z=_REST_Z, cap=0.25, grasp_metric="beaker_grasped"
+            weight=20.0, height_metric="beaker_clearance", grasp_metric="beaker_grasped", cap=0.25
         ),
+        # These and the goal terms gate on the centre 2 cm up, which no tipping on the bench reaches (1.15 cm).
         lifting_object=RewardTerm.configure(
             func=custom_terms.object_is_lifted,
             weight=5.0,
@@ -908,19 +986,33 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
                 "deadband": 0.02,
             },
         ),
-        # Keep it upright once it is off the bench: ~0.06 at 20 deg; past 45 deg the episode ends wherever it is.
-        beaker_upright=LiftedObjectTilt.configure(
-            weight=-20.0, object_name="beaker", rest_z=_REST_Z, margin=0.01, tilt_metric="beaker_tilt"
+        # Keep it upright once it is gripped or off the bench: ~0.06 at 20 deg; past 45 deg the episode ends wherever
+        # it is.
+        beaker_upright=HeldObjectTilt.configure(
+            weight=-20.0,
+            tilt_metric="beaker_tilt",
+            clearance_metric="beaker_clearance",
+            grasp_metric="beaker_grasped",
+            margin=0.01,
         ),
-        # Carry it smoothly: the beaker's angular velocity squared, off the bench (1 rad/s costs 0.5 a step).
-        beaker_ang_vel=LiftedObjectAngVel.configure(weight=-0.5, object_name="beaker", rest_z=_REST_Z, margin=0.01),
+        # Carry it smoothly: the beaker's angular velocity squared, held (1 rad/s costs 0.5 a step, at most 4.5).
+        beaker_ang_vel=HeldObjectAngVel.configure(
+            weight=-0.5,
+            object_name="beaker",
+            clearance_metric="beaker_clearance",
+            grasp_metric="beaker_grasped",
+            margin=0.01,
+            max_ang_vel=3.0,
+        ),
         # The hand pressing on the bench (the first version's policy lay on it): -0.02 per N, at most -0.6.
         hand_on_bench=ContactForceWith.configure(
             weight=-0.02, entity_name="robot", links_name=_HAND_LINKS, other_name="bench_top", max_force=30.0
         ),
         # Smoothness regularizers, ramped in by the curriculum once the grasp and lift are learned.
         action_rate=RewardTerm.configure(func=rewards.action_rate_l2, weight=-0.05),
-        arm_joint_vel=NamedDofsVelLimits.configure(entity_name="robot", dofs_name=_ARM_DOFS, max_vel=0.5, weight=-0.01),
+        arm_joint_vel=NamedDofsVelLimits.configure(
+            entity_name="robot", dofs_name=_ARM_DOFS, max_vel=0.5, cap=15.0, weight=-0.01
+        ),
         # Hold still once the beaker is at the goal (goal tracking is flat there).
         settle_at_goal=RewardTerm.configure(
             func=custom_terms.settle_at_goal,
@@ -938,6 +1030,12 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
             params={"object_name": "beaker", "threshold": _BENCH_TOP - 0.04},
         ),
         beaker_spilled=terminations.MetricAbove.configure(metric_name="beaker_tilt", threshold=_SPILL_TILT),
+        # Flung by the contact solver. A knocked-over beaker turns at 10-20 rad/s, and the palm moves under 0.5 m/s.
+        beaker_ejected=DoneTerm.configure(
+            func=object_ejected,
+            time_out=False,
+            params={"object_name": "beaker", "max_lin_vel": 3.0, "max_ang_vel": 50.0},
+        ),
     )
 
     event_options: EventManagerOptions = EventManagerOptions(
@@ -1061,5 +1159,5 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
         max_iterations=3000,
         save_interval=50,
         experiment_name="g1_beaker_lift",
-        run_name="v3",
+        run_name="v4",
     )

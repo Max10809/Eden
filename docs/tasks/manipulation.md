@@ -175,13 +175,21 @@ eden train --task manipulation_g1_beaker_lift
   it is rewarded and gates the lift-height reward. `GraspClosure` pays the fingers for closing at the beaker. The
   distance-based approach terms are worth at most 5 a step against up to 45 for a grasp and lift: at full weight, a
   first version's policy lay the open hand around the beaker's foot and collected them without ever closing.
+- **Lift is clearance.** The lift-height reward pays how far the beaker's bottom clears the bench
+  (`cylinder_clearance`), not its centre's height: paid for the centre, a policy gripped the beaker, tipped it 20°
+  onto its rim (the centre rises 0.9 cm) and held it there all episode without lifting.
 - **The beaker must stay upright.** An `object_tilt` metric (`1 − cos` of the tilt) is penalized once the beaker is
-  off the bench and ends the episode past 45° wherever it is.
-- **No creep, slow carrying.** At Genesis' default `impratio` (1, with the pyramidal friction cone) the soft
+  gripped or off the bench, and ends the episode past 45° wherever it is.
+- **Little creep, slow carrying.** At Genesis' default `impratio` (1, with the pyramidal friction cone) the soft
   friction constraints let a held beaker turn in the hand at about 4°/s under a steady 46 N grip, and a policy
-  learns to chase it with its wrist; the task sets `impratio=100`, which stops it (0.3° in 6 s). The noslip solver
-  stops it too but cuts training throughput 4.5×. The palm moves at most about 0.17 m/s, and the carried beaker's
-  angular velocity is penalized.
+  learns to chase it with its wrist; the task sets `impratio=10`, at which it turns 0.45°/s. Stiffer friction
+  stops it (0.06°/s at 100), but makes the contact solver's blow-ups far worse (below). The noslip solver stops it
+  too but cuts training throughput 4.5×. The palm moves at most about 0.17 m/s, and the held beaker's angular
+  velocity is penalized.
+- **Solver blow-ups stay out of the returns.** A hand striking the beaker can make the contact solver fling the
+  beaker and the arm: under an early policy's exploration, arm joints reached 7000 rad/s at `impratio=100`, 140 at
+  10. An episode whose beaker is flung (past 3 m/s or 50 rad/s) ends, and the beaker-spin and arm-speed penalties
+  are capped; uncapped, their squares took a training run's value loss to 3e18 and stalled it.
 - **The beaker is moved before the grasp.** `DisplaceRestingObject` teleports a resting beaker the hand has not
   reached yet to a fresh spot, at random intervals, so the policy re-targets a beaker someone moved.
 - **State-based, deployment-shaped observations.** The policy sees the arm and hand encoders, forward kinematics of

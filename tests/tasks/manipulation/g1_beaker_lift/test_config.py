@@ -1,7 +1,7 @@
 """Tests for ``eden.tasks.manipulation.g1_beaker_lift.config``: what the policy observes, the welded pelvis, the arm
-holding its commanded pose, the stiff waist, the pre-grasp start, the grasp-gated lift reward, a scripted grasp and
-lift through the task's own actions, the beaker's tilt, the joint-subset penalties and the beaker displacement, on
-the built task.
+holding its commanded pose, the stiff waist, the pre-grasp start, the grasp-gated lift reward, the beaker's clearance,
+the gates and cap of its tilt and spin costs and the flung-beaker termination, a scripted grasp and lift through the
+task's own actions, the beaker's tilt, the joint-subset penalties and the beaker displacement, on the built task.
 """
 
 from __future__ import annotations
@@ -153,6 +153,69 @@ def test_lift_height_pays_nothing_for_a_beaker_off_the_bench_that_the_hand_does_
     env.reset()
 
 
+def _quat_about_x(deg: float) -> tuple[float, float, float, float]:
+    half = math.radians(deg) / 2
+    return (math.cos(half), math.sin(half), 0.0, 0.0)
+
+
+#: Tipped 20 deg onto its rim on the bench, the beaker's centre is 0.035 sin 20 + 0.0475 cos 20 - 0.0475 = 0.0091 m up:
+#: where the third version's policy held it, paid for the lift.
+_ON_RIM_20 = (_BEAKER_HOME[0], _BEAKER_HOME[1], _REST_Z + 0.0091)
+
+
+@pytest.mark.requires_genesis
+@pytest.mark.parametrize(
+    ("tilt_deg", "pos", "clearance"),
+    [
+        (0.0, _BEAKER_HOME, 0.0),
+        (20.0, _ON_RIM_20, 0.0),
+        (0.0, (_BEAKER_HOME[0], _BEAKER_HOME[1], _REST_Z + 0.05), 0.05),
+        (20.0, (_ON_RIM_20[0], _ON_RIM_20[1], _ON_RIM_20[2] + 0.05), 0.05),
+    ],
+)
+def test_beaker_clearance_is_its_bottom_above_the_bench_so_tipping_onto_the_rim_is_no_lift(
+    env, tilt_deg, pos, clearance
+):
+    _set_beaker(env, pos, _quat_about_x(tilt_deg))
+    env.metric_manager.compute()
+    torch.testing.assert_close(
+        env.metric_manager.get_value("beaker_clearance"), torch.full((NUM_ENVS,), clearance), atol=1e-4, rtol=0
+    )
+    env.reset()
+
+
+@pytest.mark.requires_genesis
+def test_tilt_and_spin_cost_once_the_beaker_is_off_the_bench_and_the_spin_cost_is_capped(env):
+    upright = env.reward_manager.get_term("beaker_upright")
+    ang_vel = env.reward_manager.get_term("beaker_ang_vel")
+    ejected = env.termination_manager.get_term("beaker_ejected")
+    beaker = env.entities["beaker"]
+    tilt_20 = torch.full((NUM_ENVS,), 1.0 - math.cos(math.radians(20.0)))
+
+    def spin(rad_s: float) -> None:
+        beaker.set_dofs_vel(torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, rad_s]] * NUM_ENVS))
+        env.metric_manager.compute()
+
+    # On its rim and not gripped: a nudge from a closing hand, which costs nothing.
+    _set_beaker(env, _ON_RIM_20, _quat_about_x(20.0))
+    spin(1.0)
+    torch.testing.assert_close(upright.compute(), torch.zeros(NUM_ENVS))
+    torch.testing.assert_close(ang_vel.compute(), torch.zeros(NUM_ENVS))
+
+    # Off the bench.
+    _set_beaker(env, (_ON_RIM_20[0], _ON_RIM_20[1], _ON_RIM_20[2] + 0.05), _quat_about_x(20.0))
+    spin(1.0)
+    torch.testing.assert_close(upright.compute(), tilt_20, atol=1e-5, rtol=0)
+    torch.testing.assert_close(ang_vel.compute(), torch.ones(NUM_ENVS), atol=1e-4, rtol=0)
+    assert not ejected.compute().any()
+
+    # Flung by the contact solver: the cost stops at 3 rad/s squared, and the episode ends.
+    spin(60.0)
+    torch.testing.assert_close(ang_vel.compute(), torch.full((NUM_ENVS,), 9.0), atol=1e-4, rtol=0)
+    assert ejected.compute().all()
+    env.reset()
+
+
 def _beaker_in_hand(env) -> torch.Tensor:
     """The beaker's orientation in the palm (wrist-yaw link) frame, wxyz."""
     robot = env.entities["robot"]
@@ -178,6 +241,11 @@ def test_closing_and_raising_the_hand_from_the_pregrasp_lifts_the_beaker_and_hol
             action[:, 6:13] = hand_action * min(1.0, (step + 1) / 15)
             env.step(action)
         torch.testing.assert_close(env.metric_manager.get_value("beaker_grasped"), torch.ones(NUM_ENVS))
+        # Gripped but still on the bench: its tilt already costs, so tipping it onto the rim is no way around it.
+        assert (env.metric_manager.get_value("beaker_clearance") < 0.01).all()
+        tilt = env.metric_manager.get_value("beaker_tilt")
+        assert (tilt > 0).all()
+        torch.testing.assert_close(env.reward_manager.get_term("beaker_upright").compute(), tilt, atol=0, rtol=0)
         action[:, 2] = 1.0  # full +z, in the IK's (x, y, z, rx, ry, rz)
         grasped_steps = torch.zeros(NUM_ENVS)
         for _ in range(60):
@@ -220,6 +288,19 @@ def test_arm_joint_limit_penalty_counts_the_arm_alone(env):
     robot.set_dofs_pos(upper, dofs_idx_local=elbow.dofs_idx_local)
     # Range [-1.0472, 2.0944]: the soft band ends 5 % of the range (0.15708 rad) inside the hard limit.
     torch.testing.assert_close(penalty.compute(), torch.full((NUM_ENVS,), 0.15708), atol=1e-4, rtol=0)
+    env.reset()
+
+
+@pytest.mark.requires_genesis
+@pytest.mark.parametrize(("elbow_vel", "expected"), [(2.0, 1.5**2), (1000.0, (15.0 - 0.5) ** 2)])
+def test_arm_speed_penalty_is_a_hinge_past_half_a_rad_per_s_capped_at_15(env, elbow_vel, expected):
+    """1000 rad/s is a contact-solver blow-up: the cap keeps its square out of the returns."""
+    env.reset()
+    robot = env.entities["robot"]
+    elbow = robot.find_named_dofs(["right_elbow_joint"])
+    robot.set_dofs_vel(torch.full((NUM_ENVS, 1), elbow_vel), dofs_idx_local=elbow.dofs_idx_local)
+    penalty = env.reward_manager.get_term("arm_joint_vel")
+    torch.testing.assert_close(penalty.compute(), torch.full((NUM_ENVS,), expected), atol=1e-3, rtol=0)
     env.reset()
 
 
