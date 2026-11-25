@@ -15,7 +15,10 @@ stiffening, on a :class:`~eden.options.robots.G1Dofs29Dex3` instead of a table-m
   target (:class:`AccumulatedDifferentialIKController`): the G1 arm has no gravity compensation, so deltas on the
   measured joints would let it sink onto the bench under a zero action. Every other joint is held at its default by
   :class:`NullJointAction`, which takes no action columns. Only the right forearm, the hand and the torso collide:
-  without the torso, a policy tucked its elbow into the body in 15 % of its episodes, and touching it costs.
+  without the torso, the fourth version's policy sank its forearm into the body in half its episodes. Colliding,
+  the fifth version's rested on it as often, and a cost on that contact changed nothing: the IK, not the policy,
+  places the elbow (seven joints under a six-row task), so the IK keeps it 16 cm out from the torso's midline with
+  steps in its nullspace, which leave the palm nearly where the action puts it.
 * **The bench sets the reach.** With the pelvis and waist fixed, the palm reaches about 35 cm in front of the pelvis
   at 0.80 m and 40-45 cm at 0.90-1.05 m (the shoulder is at 1.075 m). The bench top is therefore 0.85 m (lab benches
   are about 0.9 m), and it is a slab with knee room under it, so its front edge can sit 20 cm from the pelvis. The
@@ -32,8 +35,10 @@ stiffening, on a :class:`~eden.options.robots.G1Dofs29Dex3` instead of a table-m
   good without ever closing. Now :class:`OpposedGrasp` (thumb and fingers both pressing the beaker) is a rewarded
   metric that gates the lift-height reward, :class:`GraspClosure` pays the fingers for closing at the beaker, the
   approach terms are worth at most 5 a step against up to 45 for a grasp and lift, and pressing the bench costs.
-  :class:`DigitsPressing` pays a little more when the middle finger presses too: a thumb-index pinch, which the
-  fourth version's policy used, lets the beaker turn about its two contacts.
+  A thumb-index pinch counts: the fifth version paid 2 a step for the middle finger pressing too
+  (:class:`DigitsPressing`, now only logged), and its policy rested that finger on the beaker at 2 N against 20 N
+  on the thumb and the index, held the beaker 4 deg more tipped to reach it, and kept fewer of the heavy, slippery
+  ones. The fourth version's pinches had held those as well as its three-digit grasps.
 * **The beaker barely creeps in the grasp, and it is carried slowly.** Friction constraints are 10x stiffer than
   the normal ones (``impratio``): at the default the soft friction let a held beaker turn in the hand at 4 deg/s,
   and the policy chased it with its wrist; at 10 it turns 0.45 deg/s. The IK's per-step joint clamp is the speed
@@ -43,6 +48,9 @@ stiffening, on a :class:`~eden.options.robots.G1Dofs29Dex3` instead of a table-m
   the beaker and the arm (stiffer friction makes it worse: at ``impratio=100`` arm joints reached 7000 rad/s). An
   episode whose beaker is flung (past 3 m/s or 50 rad/s) ends, and the beaker-spin and arm-speed costs are capped:
   uncapped, the squares of those speeds took the third version's value loss to 3e18 and stalled its training.
+* **The hand's friction and the beaker's mass are redrawn every episode,** friction as one coefficient for the whole
+  hand (:class:`RandomizeSharedFriction`). Drawn once per link, the hand was almost never slippery all over, and the
+  fifth version's policy, at 99 % with every link at 1.0, held 57 % of its beakers at 0.8.
 * **A quarter of the episodes start at the grasp.** :class:`StartAtPregrasp` puts the open hand around the beaker
   at its home (a pose from which a scripted closure lifts it), so the lift is found early.
 * **Lift is clearance.** The lift reward pays how far the beaker's bottom clears the bench
@@ -123,7 +131,9 @@ from eden.utils.configs import (
     SceneOptions,
     TerminationManagerOptions,
 )
+from eden.utils.geom import transform_by_quat
 from eden.utils.misc import is_env_mask
+from eden.utils.sample import sample_uniform
 from eden.utils.string import term_subject
 
 if TYPE_CHECKING:
@@ -399,9 +409,34 @@ class AccumulatedDifferentialIKController(DifferentialIKController):
     The target stays within ``max_target_lead`` (rad) of the measured joints, so a hand pressed against the bench
     cannot wind up a target it never reaches, and inside the joint limits. It restarts from the measured joints on
     the first step after a reset.
+
+    With ``elbow_link_name`` set, the arm's redundant joint keeps the elbow off the body. A seven-joint arm under a
+    six-row IK leaves the elbow's swing about the shoulder-wrist line to the solve, out of the policy's reach, so a
+    cost on the elbow touching the body has nothing to act on. Instead, when ``elbow_link_name``'s origin comes
+    closer than ``elbow_clearance`` (m) to the midline of ``body_link_name`` (its frame's xz-plane), on the arm's
+    ``elbow_side`` of it (-1 for a right arm, the body's -y side), a step in the IK's nullspace moves the elbow back
+    out, moving no joint more than ``elbow_max_dq`` (rad, below ``max_dq``). It leaves the palm's pose nearly where
+    the action put it: the nullspace is the measured joints', and the arm sags below the target the step is added
+    to, so swinging the elbow out 4.6 cm moved the target's palm 3 mm and turned it 1.3 deg.
+
+    The elbow's step comes first: where the sum would pass ``max_dq``, the action's step is shortened as a whole, so
+    the palm moves the way the action said, a little slower. Clamping the sum joint by joint would bend the palm's
+    path, and fitting the elbow's step into what the action leaves would leave it nothing while the policy drives
+    its actions past the clamp, which it does on most of a reach.
     """
 
     max_target_lead: float = 0.3
+    elbow_link_name: str = ""
+    body_link_name: str = ""
+    elbow_side: float = -1.0
+    elbow_clearance: float = 0.0
+    elbow_max_dq: float = 0.005
+
+    #: Damping of the nullspace projector ``I - Jt (J Jt + d I)^-1 J``: small against this arm's ``J Jt``, so the
+    #: projector removes the task's directions, but it keeps the projector bounded where ``J`` loses rank.
+    _NULLSPACE_DAMPING = 1e-4
+    #: Damping of the elbow step's one-row solve, for poses where the nullspace barely moves the elbow sideways.
+    _ELBOW_DAMPING = 1e-3
 
     def build(self) -> None:
         super().build()
@@ -414,12 +449,87 @@ class AccumulatedDifferentialIKController(DifferentialIKController):
         self._lower, self._upper = lower.clone(), upper.clone()
         self._target = torch.zeros(self.num_envs, self.num_dofs, device=self.device)
         self._from_measured = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        self._build_elbow_clearance()
+
+    def _build_elbow_clearance(self) -> None:
+        self._elbow_link = None
+        if not self.elbow_link_name:
+            if self.body_link_name or self.elbow_clearance:
+                raise ValueError(
+                    f"{term_subject(self)}: body_link_name={self.body_link_name!r} and "
+                    f"elbow_clearance={self.elbow_clearance} do nothing without elbow_link_name. Set "
+                    f"elbow_link_name too (e.g. 'right_elbow_link'), or leave all three unset."
+                )
+            return
+        if not self.body_link_name:
+            raise ValueError(
+                f"{term_subject(self)}: elbow_link_name={self.elbow_link_name!r} needs body_link_name, the link "
+                f"whose midline (its frame's xz-plane) the elbow keeps clear of, e.g. body_link_name='torso_link'."
+            )
+        if self.elbow_side not in (-1.0, 1.0):
+            raise ValueError(
+                f"{term_subject(self)}: elbow_side must be -1.0 (a right arm, on the body's -y side) or 1.0 (a left "
+                f"arm), got {self.elbow_side}."
+            )
+        if self.elbow_clearance <= 0.0 or self.elbow_max_dq <= 0.0:
+            raise ValueError(
+                f"{term_subject(self)}: elbow_clearance (m) and elbow_max_dq (rad a step) must be > 0, got "
+                f"elbow_clearance={self.elbow_clearance}, elbow_max_dq={self.elbow_max_dq}."
+            )
+        if self.max_dq is not None and self.elbow_max_dq >= self.max_dq:
+            raise ValueError(
+                f"{term_subject(self)}: elbow_max_dq={self.elbow_max_dq} must be below max_dq={self.max_dq}: the "
+                f"elbow's step comes out of the same per-step joint budget, and one as large would leave the action "
+                f"none. E.g. elbow_max_dq={self.max_dq / 3:.3g}."
+            )
+        links = []
+        for field, name in (("elbow_link_name", self.elbow_link_name), ("body_link_name", self.body_link_name)):
+            idx = resolve_link_idx(self.entity, [name], self.device, term=type(self).__name__, field=field)
+            if len(idx) != 1:
+                raise ValueError(
+                    f"{term_subject(self)}: {field}={name!r} must name one link, but it matches "
+                    f"{[self.entity.links[i].name for i in idx.tolist()]}."
+                )
+            links.append(idx)
+        self._clearance_links = torch.cat(links)  # (elbow, body)
+        self._elbow_link = self.entity.get_link(self.elbow_link_name)
+        self._body_y = torch.tensor([0.0, 1.0, 0.0], dtype=self._lower.dtype, device=self.device).expand(
+            self.num_envs, 3
+        )
+        self._eye = torch.eye(self.num_dofs, dtype=self._lower.dtype, device=self.device)
+        self._eye6 = torch.eye(6, dtype=self._lower.dtype, device=self.device)
+
+    def _elbow_step(self) -> torch.Tensor:
+        """The nullspace joint step that moves the elbow back out to ``elbow_clearance``; zero where it is clear."""
+        J = self.entity.get_jacobian(link=self._ee_link, local_point=self._ee_local_pos)[:, :, self._jac_dofs_idx]
+        J_T = J.transpose(1, 2)
+        projected = J_T @ torch.linalg.solve_ex(J @ J_T + self._NULLSPACE_DAMPING * self._eye6, J)[0]
+        nullspace = self._eye - projected  # symmetric
+        pos = self.entity.get_links_pos(ls_idx_local=self._clearance_links)  # (n_envs, 2, 3): elbow, body
+        body_quat = self.entity.get_links_quat(ls_idx_local=self._clearance_links[1:])[:, 0]
+        outward = self.elbow_side * transform_by_quat(self._body_y, body_quat)  # (n_envs, 3), world
+        shortfall = (self.elbow_clearance - ((pos[:, 0] - pos[:, 1]) * outward).sum(-1)).clamp(min=0.0)
+        J_elbow = self.entity.get_jacobian(link=self._elbow_link)[:, :3, self._jac_dofs_idx]
+        # How far each joint moves the elbow outward, restricted to motions that leave the palm alone.
+        row = (nullspace @ (outward.unsqueeze(-1) * J_elbow).sum(dim=1).unsqueeze(-1)).squeeze(-1)
+        step = row * (shortfall / (row.square().sum(-1) + self._ELBOW_DAMPING)).unsqueeze(-1)
+        largest = step.abs().amax(dim=-1, keepdim=True)
+        return step * (self.elbow_max_dq / largest.clamp(min=1e-9)).clamp(max=1.0)
 
     def compute(self, actions: torch.Tensor) -> None:
         super().compute(actions)  # _processed_action = measured + IK delta
         measured = self.entity.get_dofs_pos(dofs_idx_local=self.genesis_dofs_idx)
+        delta = self._processed_action - measured
+        if self._elbow_link is not None:
+            elbow = self._elbow_step()
+            if self.max_dq is not None:
+                # The largest share of the action's step that, with the elbow's, keeps every joint within max_dq.
+                room = torch.where(delta > 0, self.max_dq - elbow, self.max_dq + elbow) / delta.abs()
+                share = torch.where(delta != 0, room, torch.ones_like(room)).amin(dim=-1, keepdim=True)
+                delta = delta * share.clamp(0.0, 1.0)
+            delta = delta + elbow
         base = torch.where(self._from_measured.unsqueeze(-1), measured, self._target)
-        target = base + (self._processed_action - measured)
+        target = base + delta
         target = torch.clamp(target, measured - self.max_target_lead, measured + self.max_target_lead)
         self._target.copy_(torch.clamp(target, self._lower, self._upper))
         self._from_measured.fill_(False)
@@ -428,6 +538,27 @@ class AccumulatedDifferentialIKController(DifferentialIKController):
     def reset(self, envs_idx: torch.Tensor | None = None) -> None:
         super().reset(envs_idx)
         self._from_measured[slice(None) if envs_idx is None else envs_idx] = True
+
+
+@EVENT_TERM_REGISTRY.register()
+class RandomizeSharedFriction(RandomizeFrictionRatio):
+    """:class:`RandomizeFrictionRatio` with one coefficient per env shared by every link in ``links_name``.
+
+    Drawn per link, a hand's links almost never all come out slippery together: over 0.8-2.0, the thumb's and index
+    finger's four phalanges are all under 0.9 in one env in 20000, so a policy trained on per-link draws never meets
+    a slippery hand. Shared, one env in twelve has one.
+    """
+
+    def compute(self, envs_idx: slice | torch.Tensor | None = None) -> None:
+        if envs_idx is None:
+            envs_idx = slice(None)
+        friction = sample_uniform(
+            self.friction_range[0], self.friction_range[1], (self._env.num_envs, 1), device=self._env.device
+        )[envs_idx]
+        self.entity.set_friction(1.0)
+        self.entity.set_friction_ratio(
+            friction.expand(-1, len(self.links_name)).contiguous(), ls_idx_local=self.ls_idx_local, envs_idx=envs_idx
+        )
 
 
 @EVENT_TERM_REGISTRY.register()
@@ -955,6 +1086,9 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
         # limit; the scales are not, because the damping is large against this arm's J Jt and shrinks every step a
         # lot (0.3 of full +z for 60 steps raised the palm 3 cm), so a policy drives the actions past 1. Measured
         # palm speed during the reach (median): 0.61 m/s at 0.2 rad a step, 0.29 at 0.03, 0.19 at 0.015.
+        # The elbow is kept 16 cm out from the torso's midline (17 cm at the ready pose): the fifth version's policy
+        # rested its forearm on the torso in 54 % of its episodes and 28 % of its steps, with a cost on the contact
+        # it had no way to act on. Under this, the same policy touched it in 0.2 % of its steps.
         arm_ik=AccumulatedDifferentialIKController.configure(
             entity_name="robot",
             dofs_name=_ARM_DOFS,
@@ -964,6 +1098,11 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
             orientation_scale=0.05,
             damping=0.1,
             max_dq=0.015,
+            elbow_link_name="right_elbow_link",
+            body_link_name="torso_link",
+            elbow_side=-1.0,
+            elbow_clearance=0.16,
+            elbow_max_dq=0.005,
         ),
         # Joint PD on the right Dex3 around its open default; one action unit is half of each joint's range, so the
         # fingers reach closed within the policy's first few standard deviations.
@@ -1011,7 +1150,7 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
             force_threshold=0.5,
             contributes_to_success=False,
         ),
-        # Thumb, index and middle finger each pressing it.
+        # Thumb, index and middle finger each pressing it: logged, not paid (see the module docstring).
         beaker_three_digit=DigitsPressing.configure(
             entity_name="robot",
             object_name="beaker",
@@ -1053,9 +1192,6 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
         ),
         # Thumb and fingers both pressing the beaker.
         beaker_grasped=rewards.MetricReward.configure(metric_name="beaker_grasped", weight=4.0),
-        # On top of it, the middle finger pressing too: the fourth version's policy held 38 % of its beakers in a pinch
-        # and touched the middle finger to the rest with 2 N, against 20 N on the thumb and the index.
-        beaker_three_digit=rewards.MetricReward.configure(metric_name="beaker_three_digit", weight=2.0),
         # How far the beaker's bottom clears the bench, while grasped.
         lift_height=GraspedLiftHeight.configure(
             weight=20.0, height_metric="beaker_clearance", grasp_metric="beaker_grasped", cap=0.25
@@ -1107,6 +1243,7 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
             weight=-0.02, entity_name="robot", links_name=_HAND_LINKS, other_name="bench_top", max_force=30.0
         ),
         # The forearm or hand on the torso: it stops the arm now, and the policy must not brace the beaker against it.
+        # The IK keeps the elbow off it; this is for the forearm and hand, which the palm's pose does place.
         arm_on_torso=LinksTouching.configure(
             weight=-1.0, entity_name="robot", links_name=_FOREARM_AND_HAND, other_links_name=["torso_link"]
         ),
@@ -1192,16 +1329,19 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
                 "entity_links": {"beaker": None, "robot": _HAND_LINKS},
             },
         ),
-        # Per-env hand friction; it decides every hand-beaker contact (the beaker's is lower, and a pair takes the max).
-        hand_friction=RandomizeFrictionRatio.configure(
-            mode=EventMode.STARTUP,
+        # The hand's friction, one coefficient for all its links, redrawn every episode; it decides every hand-beaker
+        # contact (the beaker's is lower, and a pair takes the max). Drawn per link, the hand was almost never
+        # slippery all over, and the fifth version's policy held a beaker in 57 % of episodes at 0.8 on every link,
+        # against 99 % at 1.0.
+        hand_friction=RandomizeSharedFriction.configure(
+            mode=EventMode.RESET,
             entity_name="robot",
             links_name=_HAND_LINKS,
             friction_range=(0.8, 2.0),
         ),
-        # An empty beaker to one with about 120 mL in it.
+        # An empty beaker to one with about 120 mL in it, redrawn every episode.
         beaker_mass=events.RandomizeMassShift.configure(
-            mode=EventMode.STARTUP,
+            mode=EventMode.RESET,
             entity_name="beaker",
             links_name=[".*"],
             mass_shift_range=(-0.06, 0.12),
@@ -1261,5 +1401,5 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
         max_iterations=3000,
         save_interval=50,
         experiment_name="g1_beaker_lift",
-        run_name="v5",
+        run_name="v6",
     )

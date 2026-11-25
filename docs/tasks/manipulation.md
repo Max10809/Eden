@@ -163,8 +163,10 @@ eden train --task manipulation_g1_beaker_lift
   `is_fixed_base=True`). The action is 13-D: differential IK at the right palm over the seven right-arm joints, whose
   deltas accumulate on the last joint target so the arm holds its pose without gravity compensation, and a joint PD
   over the seven right Dex3 joints. Every other joint is held at its default, and only the right forearm, the hand
-  and the torso collide. Without the torso a policy tucked its elbow into the body in 15 % of its episodes; touching
-  it is now penalized too.
+  and the torso collide. Without the torso a policy sank its forearm into the body in half its episodes; with it, the
+  next rested the forearm there as often, and penalizing the contact changed nothing, because the IK, not the policy,
+  places the elbow (seven joints under a six-row task). The IK now keeps the elbow 16 cm out from the torso's
+  midline with steps in its nullspace, which leave the palm nearly where the action puts it.
 - **A stiff waist and arm.** The G1's asset gains are the whole-body trackers' (waist roll and pitch kp 28.5, arm
   14.3). With nothing driving the waist, the torso sags 27–28° under the reaching arm and no scripted grasp lifts the
   beaker; at waist kp 300 and arm kp 60, every one of 40 does. A deployment sets the same gains.
@@ -176,8 +178,10 @@ eden train --task manipulation_g1_beaker_lift
   it is rewarded and gates the lift-height reward. `GraspClosure` pays the fingers for closing at the beaker. The
   distance-based approach terms are worth at most 5 a step against up to 45 for a grasp and lift: at full weight, a
   first version's policy lay the open hand around the beaker's foot and collected them without ever closing. A
-  `DigitsPressing` metric (thumb, index and middle finger each pressing) pays a little more on top: a thumb-index
-  pinch lets the beaker turn about its two contacts, 6–10× more than a three-point grasp in scripted tests.
+  thumb-index pinch counts as a grasp. A bonus for the middle finger pressing too (`DigitsPressing`, now only
+  logged) got a policy that rested that finger on the beaker at 2 N against 20 N on the thumb and the index, held
+  the beaker 4° more tipped, and lost more heavy, slippery beakers; its predecessor's pinches held as well as its
+  three-digit grasps.
 - **Lift is clearance.** The lift-height reward pays how far the beaker's bottom clears the bench
   (`cylinder_clearance`), not its centre's height: paid for the centre, a policy gripped the beaker, tipped it 20°
   onto its rim (the centre rises 0.9 cm) and held it there all episode without lifting.
@@ -193,6 +197,10 @@ eden train --task manipulation_g1_beaker_lift
   beaker and the arm: under an early policy's exploration, arm joints reached 7000 rad/s at `impratio=100`, 140 at
   10. An episode whose beaker is flung (past 3 m/s or 50 rad/s) ends, and the beaker-spin and arm-speed penalties
   are capped; uncapped, their squares took a training run's value loss to 3e18 and stalled it.
+- **Friction and mass are redrawn every episode.** The hand's friction (0.8–2.0, against the beaker's 0.5) is one
+  coefficient for the whole hand (`RandomizeSharedFriction`) and the beaker's mass is 0.12–0.30 kg. Drawn once per
+  hand link, the hand was almost never slippery all over: a policy trained that way held its beaker in 99 % of
+  episodes with every link at 1.0 and 57 % at 0.8.
 - **The beaker is moved before the grasp.** `DisplaceRestingObject` teleports a resting beaker the hand has not
   reached yet to a fresh spot, at random intervals, so the policy re-targets a beaker someone moved.
 - **State-based, deployment-shaped observations.** The policy sees the arm and hand encoders, forward kinematics of

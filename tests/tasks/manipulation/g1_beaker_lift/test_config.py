@@ -1,7 +1,8 @@
 """Tests for ``eden.tasks.manipulation.g1_beaker_lift.config``: what the policy observes, the welded pelvis, the arm
-holding its commanded pose, the stiff waist, the pre-grasp start, the grasp-gated lift reward, the beaker's clearance,
-the gates and cap of its tilt and spin costs and the flung-beaker termination, a scripted grasp and lift through the
-task's own actions, the beaker's tilt, the joint-subset penalties and the beaker displacement, on the built task.
+holding its commanded pose, the IK keeping the elbow off the torso, the stiff waist, the pre-grasp start, the
+grasp-gated lift reward, the beaker's clearance, the gates and cap of its tilt and spin costs and the flung-beaker
+termination, a scripted grasp and lift through the task's own actions, the beaker's tilt, the joint-subset penalties,
+the per-episode friction and mass draws and the beaker displacement, on the built task.
 """
 
 from __future__ import annotations
@@ -15,7 +16,10 @@ import torch
 from eden.tasks import TASK_REGISTRY
 from eden.tasks.manipulation.g1_beaker_lift.config import (
     _BEAKER_HOME,
+    _EE_LINK,
     _HAND_CLOSED,
+    _HAND_LINKS,
+    _PALM_IN_WRIST,
     _PELVIS_POS,
     _PLACE_X,
     _PLACE_Y,
@@ -23,10 +27,11 @@ from eden.tasks.manipulation.g1_beaker_lift.config import (
     _REST_Z,
     _RIGHT_ARM_READY,
     _WAIST_DOFS,
+    AccumulatedDifferentialIKController,
     ManipulationG1BeakerLiftConfig,
     object_tilt,
 )
-from eden.utils.geom import axis_angle_from_quat, inv_quat, quat_mul
+from eden.utils.geom import axis_angle_from_quat, inv_quat, quat_mul, transform_by_quat
 from tests.support.envs import build_env
 
 NUM_ENVS = 2
@@ -334,6 +339,102 @@ def test_a_full_ik_action_moves_no_arm_joint_target_more_than_the_clamp_a_step(e
     env.reset()
 
 
+#: Shoulder rolled in and yawed: the elbow 11.7 cm from the torso's midline, 4 cm inside the IK's clearance, the forearm
+#: not touching the torso and the palm 18 cm above the bench (at 5 cm, the reset's finger jitter pressed it in).
+_TUCKED = dict(
+    _RIGHT_ARM_READY,
+    right_shoulder_pitch_joint=-0.2,
+    right_shoulder_roll_joint=0.15,
+    right_shoulder_yaw_joint=0.4,
+    right_elbow_joint=-0.6,
+)
+
+
+def _elbow_offset_and_palm(env) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The elbow's distance from the torso's midline (m), and the palm centre's position and orientation."""
+    robot = env.entities["robot"]
+    _, links = robot.find_named_links_idx_local(["right_elbow_link", "torso_link", _EE_LINK], preserve_order=True)
+    pos = robot.get_links_pos(ls_idx_local=links)
+    quat = robot.get_links_quat(ls_idx_local=links)[:, 2]
+    palm = pos[:, 2] + transform_by_quat(torch.tensor([_PALM_IN_WRIST] * env.num_envs), quat)
+    return pos[:, 1, 1] - pos[:, 0, 1], palm, quat
+
+
+@contextmanager
+def _tucked_elbow(env):
+    """The arm set at ``_TUCKED`` and held there by the IK until it has settled under gravity, the elbow push off.
+
+    The tucked hand reaches over the bench's near end of the placement area, so the beaker waits at the far corner and
+    is not moved there.
+    """
+    robot = env.entities["robot"]
+    arm = robot.find_named_dofs(list(_RIGHT_ARM_READY))
+    arm_ik = env.action_manager.get_term("arm_ik")
+    move = env.event_manager.get_term("move_beaker")
+    clearance, probability = arm_ik.elbow_clearance, move.probability
+    env.reset()
+    try:
+        arm_ik.elbow_clearance, move.probability = 1e-6, 0.0
+        _set_beaker(env, (_BEAKER_HOME[0] + _PLACE_X[1], _BEAKER_HOME[1] + _PLACE_Y[0], _REST_Z))
+        robot.set_dofs_pos(torch.tensor([list(_TUCKED.values())] * NUM_ENVS), dofs_idx_local=arm.dofs_idx_local)
+        arm_ik.reset()
+        for _ in range(40):
+            env.step(_zero_action(env))
+        arm_ik.elbow_clearance = clearance
+        yield arm_ik
+    finally:
+        arm_ik.elbow_clearance, move.probability = clearance, probability
+        env.reset()
+
+
+@pytest.mark.requires_genesis
+def test_the_ik_moves_a_tucked_elbow_out_to_its_clearance_and_leaves_the_palm_where_it_was(env):
+    """The fifth version's policy, which has no way to place the elbow, rested the forearm on the torso a quarter of
+    the time. The IK's nullspace moves the elbow out to 16 cm, and the palm by a tenth of that: the IK solves at the
+    measured joints, which the unassisted arm sags below the target the step is added to.
+    """
+    touching = env.reward_manager.get_term("arm_on_torso")
+    with _tucked_elbow(env):
+        before, palm_before, quat_before = _elbow_offset_and_palm(env)
+        assert (before < 0.12).all(), before
+        for _ in range(80):
+            env.step(_zero_action(env))
+            torch.testing.assert_close(touching.compute(), torch.zeros(NUM_ENVS))
+        after, palm_after, quat_after = _elbow_offset_and_palm(env)
+    torch.testing.assert_close(after, torch.full((NUM_ENVS,), 0.16), atol=2e-3, rtol=0)
+    assert ((palm_after - palm_before).norm(dim=-1) < 6e-3).all(), palm_after - palm_before
+    turned = axis_angle_from_quat(quat_mul(quat_after, inv_quat(quat_before))).norm(dim=-1)
+    assert (torch.rad2deg(turned) < 2.0).all(), torch.rad2deg(turned)
+
+
+@pytest.mark.requires_genesis
+def test_the_elbow_push_shortens_a_full_action_instead_of_passing_the_joint_clamp(env):
+    with _tucked_elbow(env) as arm_ik:
+        assert (_elbow_offset_and_palm(env)[0] < arm_ik.elbow_clearance).all()  # the push is on
+        before = arm_ik.processed_action.clone()
+        action = _zero_action(env)
+        action[:, :6] = 1.0
+        env.step(action)
+        step = (arm_ik.processed_action - before).abs()
+    assert step.max() <= 0.015 + 1e-6
+
+
+@pytest.mark.requires_genesis
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"elbow_link_name": "right_elbow_link", "body_link_name": ""}, "needs body_link_name"),
+        ({"elbow_link_name": "", "body_link_name": "torso_link"}, "do nothing without elbow_link_name"),
+        ({"elbow_side": 0.5}, "elbow_side must be -1.0"),
+        ({"elbow_max_dq": 0.015}, "must be below max_dq"),
+    ],
+)
+def test_a_half_configured_elbow_clearance_is_refused_at_build(env, change, message):
+    options = ManipulationG1BeakerLiftConfig().action_options.arm_ik.model_copy(update=change)
+    with pytest.raises(ValueError, match=message):
+        AccumulatedDifferentialIKController(env, options).build()
+
+
 @pytest.mark.requires_genesis
 def test_the_torso_pushes_the_forearm_out_and_touching_it_costs(env):
     """Shoulder yawed in 1.3 rad, elbow straight: the forearm lies in the belly. At the ready pose nothing touches."""
@@ -368,6 +469,32 @@ def test_arm_speed_penalty_is_a_hinge_past_half_a_rad_per_s_capped_at_15(env, el
     penalty = env.reward_manager.get_term("arm_joint_vel")
     torch.testing.assert_close(penalty.compute(), torch.full((NUM_ENVS,), expected), atol=1e-3, rtol=0)
     env.reset()
+
+
+@pytest.mark.requires_genesis
+def test_the_hand_friction_is_one_draw_for_the_whole_hand_and_it_and_the_beaker_mass_are_redrawn_every_episode(env):
+    """Drawn per link, the hand was almost never slippery all over; drawn once, an env kept its hand and beaker."""
+    friction = env.event_manager.get_term("hand_friction")
+    mass = env.event_manager.get_term("beaker_mass")
+    robot, beaker = env.entities["robot"], env.entities["beaker"]
+    _, hand = robot.find_named_links_idx_local(_HAND_LINKS, preserve_order=True)
+    fixed = friction.friction_range, mass.mass_shift_range
+    friction.friction_range, mass.mass_shift_range = (0.8, 2.0), (-0.06, 0.12)
+    draws = []
+    try:
+        for _ in range(2):
+            env.reset()
+            draws.append((robot.get_friction_ratio(ls_idx_local=hand), beaker.get_mass_shift()))
+    finally:
+        friction.friction_range, mass.mass_shift_range = fixed
+        env.reset()
+    for ratio, shift in draws:
+        assert ratio.shape == (NUM_ENVS, len(_HAND_LINKS))
+        torch.testing.assert_close(ratio, ratio[:, :1].expand_as(ratio))
+        assert ((ratio >= 0.8) & (ratio <= 2.0)).all()
+        assert ((shift >= -0.06 - 1e-6) & (shift <= 0.12 + 1e-6)).all()
+    assert not torch.allclose(draws[0][0], draws[1][0])
+    assert not torch.allclose(draws[0][1], draws[1][1])
 
 
 @pytest.mark.requires_genesis
