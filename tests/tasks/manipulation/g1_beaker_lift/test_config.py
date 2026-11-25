@@ -21,6 +21,7 @@ from eden.tasks.manipulation.g1_beaker_lift.config import (
     _PLACE_Y,
     _PREGRASP_ARM,
     _REST_Z,
+    _RIGHT_ARM_READY,
     _WAIST_DOFS,
     ManipulationG1BeakerLiftConfig,
     object_tilt,
@@ -241,6 +242,7 @@ def test_closing_and_raising_the_hand_from_the_pregrasp_lifts_the_beaker_and_hol
             action[:, 6:13] = hand_action * min(1.0, (step + 1) / 15)
             env.step(action)
         torch.testing.assert_close(env.metric_manager.get_value("beaker_grasped"), torch.ones(NUM_ENVS))
+        torch.testing.assert_close(env.metric_manager.get_value("beaker_three_digit"), torch.ones(NUM_ENVS))
         # Gripped but still on the bench: its tilt already costs, so tipping it onto the rim is no way around it.
         assert (env.metric_manager.get_value("beaker_clearance") < 0.01).all()
         tilt = env.metric_manager.get_value("beaker_tilt")
@@ -266,6 +268,31 @@ def test_closing_and_raising_the_hand_from_the_pregrasp_lifts_the_beaker_and_hol
 
 
 @pytest.mark.requires_genesis
+def test_a_thumb_index_pinch_is_a_grasp_but_not_a_three_digit_one(env):
+    """From the beaker's exact home: with the pre-grasp's 5 mm jitter about one pinch in eight misses it."""
+    start = env.event_manager.get_term("pregrasp_start")
+    jitter, start.pos_jitter = start.pos_jitter, 0.0
+    hand = env.action_manager.get_term("hand")
+    pinch = {k: v for k, v in _HAND_CLOSED.items() if "middle" not in k}
+    hand_action = torch.tensor([[pinch.get(name, 0.0) for name in hand.dofs_name]]) / hand.effective_scale
+    action = _zero_action(env)
+    grasped, three_digit = torch.zeros(NUM_ENVS), torch.zeros(NUM_ENVS)
+    try:
+        with _pregrasp(env):
+            for step in range(30):
+                action[:, 6:13] = hand_action * min(1.0, (step + 1) / 15)
+                env.step(action)
+                if step >= 20:
+                    grasped += env.metric_manager.get_value("beaker_grasped")
+                    three_digit += env.metric_manager.get_value("beaker_three_digit")
+    finally:
+        start.pos_jitter = jitter
+    # Held on most steps (the thumb's contact hops between its phalanges), never with the middle finger.
+    assert (grasped >= 7).all(), grasped
+    torch.testing.assert_close(three_digit, torch.zeros(NUM_ENVS))
+
+
+@pytest.mark.requires_genesis
 @pytest.mark.parametrize("tilt_deg", [0.0, 45.0, 90.0])
 def test_object_tilt_is_one_minus_the_cosine_of_the_tilt(env, tilt_deg):
     half = math.radians(tilt_deg) / 2
@@ -288,6 +315,45 @@ def test_arm_joint_limit_penalty_counts_the_arm_alone(env):
     robot.set_dofs_pos(upper, dofs_idx_local=elbow.dofs_idx_local)
     # Range [-1.0472, 2.0944]: the soft band ends 5 % of the range (0.15708 rad) inside the hard limit.
     torch.testing.assert_close(penalty.compute(), torch.full((NUM_ENVS,), 0.15708), atol=1e-4, rtol=0)
+    env.reset()
+
+
+@pytest.mark.requires_genesis
+def test_a_full_ik_action_moves_no_arm_joint_target_more_than_the_clamp_a_step(env):
+    """The per-step joint clamp is the arm's speed limit (0.015 rad a 50 Hz step)."""
+    env.reset()
+    arm_ik = env.action_manager.get_term("arm_ik")
+    env.step(_zero_action(env))
+    before = arm_ik.processed_action.clone()
+    action = _zero_action(env)
+    action[:, :6] = 1.0
+    env.step(action)
+    step = (arm_ik.processed_action - before).abs()
+    assert step.max() <= 0.015 + 1e-6
+    torch.testing.assert_close(step.max(), torch.tensor(0.015), atol=1e-6, rtol=0)  # the clamp binds
+    env.reset()
+
+
+@pytest.mark.requires_genesis
+def test_the_torso_pushes_the_forearm_out_and_touching_it_costs(env):
+    """Shoulder yawed in 1.3 rad, elbow straight: the forearm lies in the belly. At the ready pose nothing touches."""
+    robot = env.entities["robot"]
+    arm = robot.find_named_dofs(list(_RIGHT_ARM_READY))
+    yaw = arm.columns[list(_RIGHT_ARM_READY).index("right_shoulder_yaw_joint")]
+    touching = env.reward_manager.get_term("arm_on_torso")
+    env.reset()
+    env.step(_zero_action(env))
+    torch.testing.assert_close(touching.compute(), torch.zeros(NUM_ENVS))
+
+    across = dict(_RIGHT_ARM_READY, right_shoulder_pitch_joint=0.0, right_shoulder_roll_joint=0.0)
+    across.update(right_shoulder_yaw_joint=1.3, right_elbow_joint=0.0)
+    robot.set_dofs_pos(torch.tensor([list(across.values())] * NUM_ENVS), dofs_idx_local=arm.dofs_idx_local)
+    env.scene.step()  # one physics step, for the contacts at this pose
+    torch.testing.assert_close(touching.compute(), torch.ones(NUM_ENVS))
+    # Held there by the IK (re-based on the pose just set), the forearm is still pushed out within a control step.
+    env.action_manager.get_term("arm_ik").reset()
+    env.step(_zero_action(env))
+    assert (robot.get_dofs_pos()[:, yaw] < 1.0).all()
     env.reset()
 
 

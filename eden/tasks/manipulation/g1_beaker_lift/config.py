@@ -14,7 +14,8 @@ stiffening, on a :class:`~eden.options.robots.G1Dofs29Dex3` instead of a table-m
   the palm, and joint PD on the seven right Dex3 joints: a 13-D action. The IK deltas accumulate on the last joint
   target (:class:`AccumulatedDifferentialIKController`): the G1 arm has no gravity compensation, so deltas on the
   measured joints would let it sink onto the bench under a zero action. Every other joint is held at its default by
-  :class:`NullJointAction`, which takes no action columns. Only the right forearm and hand collide.
+  :class:`NullJointAction`, which takes no action columns. Only the right forearm, the hand and the torso collide:
+  without the torso, a policy tucked its elbow into the body in 15 % of its episodes, and touching it costs.
 * **The bench sets the reach.** With the pelvis and waist fixed, the palm reaches about 35 cm in front of the pelvis
   at 0.80 m and 40-45 cm at 0.90-1.05 m (the shoulder is at 1.075 m). The bench top is therefore 0.85 m (lab benches
   are about 0.9 m), and it is a slab with knee room under it, so its front edge can sit 20 cm from the pelvis. The
@@ -31,11 +32,13 @@ stiffening, on a :class:`~eden.options.robots.G1Dofs29Dex3` instead of a table-m
   good without ever closing. Now :class:`OpposedGrasp` (thumb and fingers both pressing the beaker) is a rewarded
   metric that gates the lift-height reward, :class:`GraspClosure` pays the fingers for closing at the beaker, the
   approach terms are worth at most 5 a step against up to 45 for a grasp and lift, and pressing the bench costs.
+  :class:`DigitsPressing` pays a little more when the middle finger presses too: a thumb-index pinch, which the
+  fourth version's policy used, lets the beaker turn about its two contacts.
 * **The beaker barely creeps in the grasp, and it is carried slowly.** Friction constraints are 10x stiffer than
   the normal ones (``impratio``): at the default the soft friction let a held beaker turn in the hand at 4 deg/s,
-  and the policy chased it with its wrist; at 10 it turns 0.45 deg/s. The palm moves at most about 0.17 m/s (the
-  IK scales and a 1.5 rad/s joint clamp; the first versions grabbed the beaker 0.24 s in), and the held beaker's
-  angular velocity costs.
+  and the policy chased it with its wrist; at 10 it turns 0.45 deg/s. The IK's per-step joint clamp is the speed
+  limit (0.015 rad, 0.75 rad/s): the palm reaches at a median 0.19 m/s, where the first versions' 0.2 rad gave
+  0.61 m/s and grabbed the beaker 0.24 s in. The held beaker's angular velocity costs.
 * **The contact solver's blow-ups stay out of the returns.** A hand striking the beaker can make the solver fling
   the beaker and the arm (stiffer friction makes it worse: at ``impratio=100`` arm joints reached 7000 rad/s). An
   episode whose beaker is flung (past 3 m/s or 50 rad/s) ends, and the beaker-spin and arm-speed costs are capped:
@@ -191,6 +194,14 @@ _HAND_LINKS = [_EE_LINK] + [
 #: The two sides of an opposed grasp: the thumb, and the two fingers it closes against.
 _THUMB_LINKS = ["right_hand_thumb_1_link", "right_hand_thumb_2_link"]
 _FINGER_LINKS = [f"right_hand_{digit}_link" for digit in ("index_0", "index_1", "middle_0", "middle_1")]
+#: A three-point grasp: each digit by its links.
+_DIGITS = {
+    "thumb": _THUMB_LINKS,
+    "index": ["right_hand_index_0_link", "right_hand_index_1_link"],
+    "middle": ["right_hand_middle_0_link", "right_hand_middle_1_link"],
+}
+#: The right arm's colliding links below the elbow, which can reach the torso.
+_FOREARM_AND_HAND = ["right_elbow_link", "right_wrist_.*", "right_hand_.*"]
 #: Where the closing joints head when the hand closes on nothing: the thumb's distal joint closes negative, the
 #: fingers positive. A grasp on the beaker stops them about two thirds of the way.
 _HAND_CLOSED = {
@@ -264,8 +275,10 @@ _ROBOT = G1Dofs29Dex3(
     default_dofs_kd=_per_joint(
         "default_dofs_kd", {**dict.fromkeys(_WAIST_DOFS, _WAIST_KD), **dict.fromkeys(_ARM_DOFS, _ARM_KD)}
     ),
-    # Nothing else reaches the bench or the beaker, and every pair dropped is collision work saved.
-    collision_link_patterns=["right_elbow_link", "right_wrist_.*", "right_hand_.*"],
+    # The torso is what the right forearm reaches: without it, a policy tucked the elbow into the body in 15 % of
+    # its episodes, carrying the beaker to a goal near the body. Nothing else reaches the bench, the beaker or the
+    # arm, and every pair dropped is collision work saved (the torso costs 10 % of the throughput).
+    collision_link_patterns=[*_FOREARM_AND_HAND, "torso_link"],
 )
 _HELD_DOFS = [name for name in _ROBOT.dofs_name if name not in _ARM_DOFS + _HAND_DOFS]
 
@@ -569,6 +582,44 @@ class OpposedGrasp(MetricTermBase):
         return (thumb & fingers).float()
 
 
+@METRIC_TERM_REGISTRY.register()
+class DigitsPressing(MetricTermBase):
+    """1.0 where every digit in ``digits`` (name -> its links) presses the object with more than ``force_threshold`` N.
+
+    With the thumb, index and middle finger it is a three-point grasp. :class:`OpposedGrasp` also holds for a
+    thumb-index pinch, about whose two contacts the beaker can turn: in scripted grasps a pinch let it turn 6-10x
+    more in the hand.
+    """
+
+    entity_name: str = "robot"
+    object_name: str = "object"
+    digits: dict[str, list[str]] = {}
+    force_threshold: float = 0.5
+
+    def build(self) -> None:
+        entity = self.resolve_entity(self.entity_name)
+        self.resolve_entity(self.object_name)
+        if len(self.digits) < 2 or not all(self.digits.values()):
+            raise ValueError(
+                f"{term_subject(self)}: digits must name at least two digits, each with its links (got "
+                f"{self.digits}), e.g. digits={{'thumb': {entity.links_name[-2:]}, 'index': [...]}}."
+            )
+        groups = [
+            resolve_link_idx(entity, links, self.device, term=type(self).__name__) for links in self.digits.values()
+        ]
+        self._links = torch.cat(groups)
+        self._digit_of_link = torch.cat(
+            [torch.full((len(group),), i, dtype=torch.long, device=self.device) for i, group in enumerate(groups)]
+        )
+        self._n_digits = len(groups)
+
+    def compute(self) -> torch.Tensor:
+        entity, obj = self.resolve_entity(self.entity_name), self.resolve_entity(self.object_name)
+        force = entity.get_grouped_contacts(obj, links_a_idx_local=self._links)["force_norm_sum"].sum(dim=-1)
+        per_digit = force.new_zeros(force.shape[0], self._n_digits).index_add_(1, self._digit_of_link, force)
+        return (per_digit > self.force_threshold).all(dim=-1).float()
+
+
 @REWARD_TERM_REGISTRY.register()
 class GraspClosure(RewardTermBase):
     """Mean flexion of the hand's closing joints, paid while its grasp point is within ``near_distance`` of the
@@ -723,6 +774,41 @@ class ContactForceWith(RewardTermBase):
         return contacts["force_norm_sum"].sum(dim=(1, 2)).clamp(max=self.max_force)
 
 
+@REWARD_TERM_REGISTRY.register()
+class LinksTouching(RewardTermBase):
+    """1.0 where one of ``links_name`` touches one of ``other_links_name``, both links of ``entity_name``
+    (negative weight to penalize).
+
+    Self-contact, which ``get_grouped_contacts`` does not report, so it is read off ``get_contacts`` as a presence
+    rather than a force. Both sides must carry collision geoms (``collision_link_patterns``), or nothing touches.
+    """
+
+    entity_name: str = "robot"
+    links_name: list[str] = []
+    other_links_name: list[str] = []
+
+    def build(self) -> None:
+        entity = self.resolve_entity(self.entity_name)
+        if not self.links_name or not self.other_links_name:
+            raise ValueError(
+                f"{term_subject(self)}: links_name and other_links_name must both name links (got {self.links_name} "
+                f"and {self.other_links_name}), e.g. links_name=['right_elbow_link'], other_links_name=['torso_link']."
+            )
+        self._links = resolve_link_idx(entity, self.links_name, self.device, term=type(self).__name__)
+        self._other_links = resolve_link_idx(
+            entity, self.other_links_name, self.device, term=type(self).__name__, field="other_links_name"
+        )
+
+    def compute(self) -> torch.Tensor:
+        entity = self.resolve_entity(self.entity_name)
+        # Padded: the trimmed form reads the contact count back to the host every step.
+        contacts = entity.get_contacts(with_entity=entity, is_padded=True)
+        a, b = contacts["link_a"] - entity.link_start, contacts["link_b"] - entity.link_start
+        links, other = self._links, self._other_links
+        touching = (torch.isin(a, links) & torch.isin(b, other)) | (torch.isin(a, other) & torch.isin(b, links))
+        return (touching & contacts["valid_mask"]).any(dim=-1).float()
+
+
 # ---------------------------------------------------------------------------
 # Scene
 # ---------------------------------------------------------------------------
@@ -866,8 +952,9 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
     action_options: ActionManagerOptions = ActionManagerOptions(
         # 6-DOF differential IK at the palm centre over the seven right-arm joints, well damped, with a per-step
         # joint clamp, accumulated on the last target so the unassisted arm holds its pose. The clamp is the speed
-        # limit: 0.03 rad a 50 Hz step is 1.5 rad/s, so the reach from the raised hand takes over a second. At the
-        # dex-lift values (0.2 rad, 5 cm a step) the policy grabbed the beaker 0.24 s into the episode.
+        # limit; the scales are not, because the damping is large against this arm's J Jt and shrinks every step a
+        # lot (0.3 of full +z for 60 steps raised the palm 3 cm), so a policy drives the actions past 1. Measured
+        # palm speed during the reach (median): 0.61 m/s at 0.2 rad a step, 0.29 at 0.03, 0.19 at 0.015.
         arm_ik=AccumulatedDifferentialIKController.configure(
             entity_name="robot",
             dofs_name=_ARM_DOFS,
@@ -876,7 +963,7 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
             position_scale=0.02,
             orientation_scale=0.05,
             damping=0.1,
-            max_dq=0.03,
+            max_dq=0.015,
         ),
         # Joint PD on the right Dex3 around its open default; one action unit is half of each joint's range, so the
         # fingers reach closed within the policy's first few standard deviations.
@@ -924,6 +1011,14 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
             force_threshold=0.5,
             contributes_to_success=False,
         ),
+        # Thumb, index and middle finger each pressing it.
+        beaker_three_digit=DigitsPressing.configure(
+            entity_name="robot",
+            object_name="beaker",
+            digits=_DIGITS,
+            force_threshold=0.5,
+            contributes_to_success=False,
+        ),
     )
 
     # The approach terms are worth at most 5 a step, well under a grasp (4 + 2 for closing) and far under a lift
@@ -958,6 +1053,9 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
         ),
         # Thumb and fingers both pressing the beaker.
         beaker_grasped=rewards.MetricReward.configure(metric_name="beaker_grasped", weight=4.0),
+        # On top of it, the middle finger pressing too: the fourth version's policy held 38 % of its beakers in a pinch
+        # and touched the middle finger to the rest with 2 N, against 20 N on the thumb and the index.
+        beaker_three_digit=rewards.MetricReward.configure(metric_name="beaker_three_digit", weight=2.0),
         # How far the beaker's bottom clears the bench, while grasped.
         lift_height=GraspedLiftHeight.configure(
             weight=20.0, height_metric="beaker_clearance", grasp_metric="beaker_grasped", cap=0.25
@@ -1007,6 +1105,10 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
         # The hand pressing on the bench (the first version's policy lay on it): -0.02 per N, at most -0.6.
         hand_on_bench=ContactForceWith.configure(
             weight=-0.02, entity_name="robot", links_name=_HAND_LINKS, other_name="bench_top", max_force=30.0
+        ),
+        # The forearm or hand on the torso: it stops the arm now, and the policy must not brace the beaker against it.
+        arm_on_torso=LinksTouching.configure(
+            weight=-1.0, entity_name="robot", links_name=_FOREARM_AND_HAND, other_links_name=["torso_link"]
         ),
         # Smoothness regularizers, ramped in by the curriculum once the grasp and lift are learned.
         action_rate=RewardTerm.configure(func=rewards.action_rate_l2, weight=-0.05),
@@ -1159,5 +1261,5 @@ class ManipulationG1BeakerLiftConfig(EdenRLConfig):
         max_iterations=3000,
         save_interval=50,
         experiment_name="g1_beaker_lift",
-        run_name="v4",
+        run_name="v5",
     )

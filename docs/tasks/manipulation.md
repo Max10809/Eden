@@ -162,8 +162,9 @@ eden train --task manipulation_g1_beaker_lift
 - **Upper body only.** The pelvis is welded to an invisible fixed mount (the G1 MJCF's free base cannot take
   `is_fixed_base=True`). The action is 13-D: differential IK at the right palm over the seven right-arm joints, whose
   deltas accumulate on the last joint target so the arm holds its pose without gravity compensation, and a joint PD
-  over the seven right Dex3 joints. Every other joint is held at its default, and only the right forearm and hand
-  collide.
+  over the seven right Dex3 joints. Every other joint is held at its default, and only the right forearm, the hand
+  and the torso collide. Without the torso a policy tucked its elbow into the body in 15 % of its episodes; touching
+  it is now penalized too.
 - **A stiff waist and arm.** The G1's asset gains are the whole-body trackers' (waist roll and pitch kp 28.5, arm
   14.3). With nothing driving the waist, the torso sags 27–28° under the reaching arm and no scripted grasp lifts the
   beaker; at waist kp 300 and arm kp 60, every one of 40 does. A deployment sets the same gains.
@@ -174,7 +175,9 @@ eden train --task manipulation_g1_beaker_lift
 - **A grasp is contact.** `OpposedGrasp` is a metric that holds while the thumb and a finger both press the beaker;
   it is rewarded and gates the lift-height reward. `GraspClosure` pays the fingers for closing at the beaker. The
   distance-based approach terms are worth at most 5 a step against up to 45 for a grasp and lift: at full weight, a
-  first version's policy lay the open hand around the beaker's foot and collected them without ever closing.
+  first version's policy lay the open hand around the beaker's foot and collected them without ever closing. A
+  `DigitsPressing` metric (thumb, index and middle finger each pressing) pays a little more on top: a thumb-index
+  pinch lets the beaker turn about its two contacts, 6–10× more than a three-point grasp in scripted tests.
 - **Lift is clearance.** The lift-height reward pays how far the beaker's bottom clears the bench
   (`cylinder_clearance`), not its centre's height: paid for the centre, a policy gripped the beaker, tipped it 20°
   onto its rim (the centre rises 0.9 cm) and held it there all episode without lifting.
@@ -184,8 +187,8 @@ eden train --task manipulation_g1_beaker_lift
   friction constraints let a held beaker turn in the hand at about 4°/s under a steady 46 N grip, and a policy
   learns to chase it with its wrist; the task sets `impratio=10`, at which it turns 0.45°/s. Stiffer friction
   stops it (0.06°/s at 100), but makes the contact solver's blow-ups far worse (below). The noslip solver stops it
-  too but cuts training throughput 4.5×. The palm moves at most about 0.17 m/s, and the held beaker's angular
-  velocity is penalized.
+  too but cuts training throughput 4.5×. The IK's per-step joint clamp (0.015 rad, 0.75 rad/s) sets the speed —
+  the palm reaches at a median 0.19 m/s — and the held beaker's angular velocity is penalized.
 - **Solver blow-ups stay out of the returns.** A hand striking the beaker can make the contact solver fling the
   beaker and the arm: under an early policy's exploration, arm joints reached 7000 rad/s at `impratio=100`, 140 at
   10. An episode whose beaker is flung (past 3 m/s or 50 rad/s) ends, and the beaker-spin and arm-speed penalties
