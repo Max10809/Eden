@@ -98,7 +98,7 @@ from eden.managers.terms.events import RandomizeFrictionRatio
 from eden.managers.terms.events.resets import reset_base_state_uniform
 from eden.managers.terms.utils import resolve_link_idx, resolve_metric_manager, soft_dof_pos_violation
 from eden.options import ObservationGroupOptions
-from eden.options.entities import BoxOptions, CylinderOptions, SphereOptions
+from eden.options.entities import BoxOptions, CylinderOptions, EntityOptions, SphereOptions
 from eden.options.learning.rsl_rl import (
     RslRlActorOptions,
     RslRlCriticOptions,
@@ -945,7 +945,22 @@ class LinksTouching(RewardTermBase):
 # ---------------------------------------------------------------------------
 
 
-def _bench_scene() -> SceneOptions:
+def _beaker() -> CylinderOptions:
+    """The beaker: a solid cylinder at its home on the bench."""
+    return CylinderOptions(
+        radius=_BEAKER_RADIUS,
+        height=_BEAKER_HEIGHT,
+        default_root_pos=_BEAKER_HOME,
+        material=RigidMaterialOptions(
+            rho=_BEAKER_MASS / (torch.pi * _BEAKER_RADIUS**2 * _BEAKER_HEIGHT),
+            friction=_BEAKER_FRICTION,
+        ),
+        color=(0.75, 0.90, 1.0, 0.6),
+    )
+
+
+def _bench_scene(**objects: EntityOptions) -> SceneOptions:
+    """The welded G1 at the bench, with ``objects`` (entity name -> options) on it; :func:`_beaker` by default."""
     return en.scenes.Empty(
         robot=_ROBOT,
         # Holds the pelvis: invisible, never in contact, welded to the robot below.
@@ -970,16 +985,7 @@ def _bench_scene() -> SceneOptions:
             default_root_pos=(sum(_CABINET_X) / 2, _BENCH_Y, (_BENCH_TOP - _SLAB) / 2),
             color=(0.35, 0.40, 0.45, 1.0),
         ),
-        beaker=CylinderOptions(
-            radius=_BEAKER_RADIUS,
-            height=_BEAKER_HEIGHT,
-            default_root_pos=_BEAKER_HOME,
-            material=RigidMaterialOptions(
-                rho=_BEAKER_MASS / (torch.pi * _BEAKER_RADIUS**2 * _BEAKER_HEIGHT),
-                friction=_BEAKER_FRICTION,
-            ),
-            color=(0.75, 0.90, 1.0, 0.6),
-        ),
+        **(objects or {"beaker": _beaker()}),
         # Visual-only goal marker, moved to the goal during eval and inference.
         goal_marker=SphereOptions(
             radius=0.02,

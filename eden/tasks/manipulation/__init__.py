@@ -28,6 +28,8 @@ Registered tasks, all on the ``Droid`` robot unless noted:
   dexterous hand instead of the 2F85.
 * ``manipulation_g1_beaker_lift`` (``g1_beaker_lift/config.py``) — ``manipulation_dex_lift`` on a pelvis-welded
   Unitree G1 with Dex3 hands, lifting a beaker off a lab bench and keeping it upright.
+* ``manipulation_g1_beaker_pour`` (``g1_beaker_pour/config.py``) — ``manipulation_g1_beaker_lift`` with a beaker of
+  beads to pour into a second beaker; trains on from a lift checkpoint (``g1_beaker_pour/warm_start.py``).
 
 Other robots reuse the MDP terms in :mod:`eden.tasks.manipulation.custom_terms` and the composite manipulator
 specs in :mod:`eden.options.robots.composite` (``Droid`` / ``COMPOSITE_ROBOT_REGISTRY``).

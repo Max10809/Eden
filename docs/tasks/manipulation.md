@@ -15,6 +15,7 @@ from the [task index](index.md), which also has the commands every task shares.
 | [`manipulation_lift_ycb_rgb`](#lift-ycb-from-rgb) | Franka Panda + Robotiq 2F-85 | `--object_properties` | 1024 |
 | [`manipulation_dex_lift`](#dexterous-lift) | Franka + XHand1 (left) | — | 4096 |
 | [`manipulation_g1_beaker_lift`](#g1-beaker-lift) | Unitree G1 + Dex3 hands, pelvis welded | — | 4096 |
+| [`manipulation_g1_beaker_pour`](#g1-beaker-pour) | Unitree G1 + Dex3 hands, pelvis welded | — | 4096 |
 | [`reorient`](#in-hand-reorientation) | Wuji Hand 1 (simplified collision model) | `--hand` | 4096 |
 | [`piano`](#piano) | Two Wuji Hand 2 (beta2) | `--song` | 1024 |
 | [`omnireset`](#omnireset) | UR5e + Robotiq 2F-85 | `--robot` | 4096 |
@@ -206,6 +207,68 @@ eden train --task manipulation_g1_beaker_lift
 - **State-based, deployment-shaped observations.** The policy sees the arm and hand encoders, forward kinematics of
   them, the goal, its last action and a noised beaker pose with a 3-frame history (what a perception module would
   supply); the critic also sees the fingertip-to-beaker offsets and the beaker's velocity.
+
+## G1 beaker pour
+
+`manipulation_g1_beaker_pour` goes on from the beaker lift: the same welded G1 picks a beaker of eight glass beads (a
+stand-in for a liquid) off the bench and pours them into a second beaker beside it. Its actor observes what the
+lift's does and acts the same way, so it trains on from a lift checkpoint, widened first for its critic's extra
+inputs:
+
+```bash
+uv run python -m eden.tasks.manipulation.g1_beaker_pour.warm_start \
+    logs/manipulation_g1_beaker_lift/<run>/model_<iter>.pt pour_init.pt
+eden train --task manipulation_g1_beaker_pour --checkpoint pour_init.pt
+```
+
+- **Hollow beakers, rigid beads.** Both beakers are open cylinders of 16 wall panels (4 mm) on a 6 mm bottom
+  (`HollowBeakerOptions`, generated MJCF), the lift's beaker's size. The beads (`BeadsOptions`) are eight free 8 mm
+  spheres of 6 g in one entity, stacked in the source at every reset (`FillBeads`); they leave it past about 100° of
+  tilt. Eight, not more: each bead adds six DOFs to every constraint solve, and at 4096 envs 20 beads of 6 mm
+  trained at 1400 env-steps/s, eight at 10500 (the lift runs at about 45000).
+- **Everything that touches collides.** Beads with each other, both beakers, the bench and the hand; the beakers
+  with each other, the hand and the bench. The lift's stiff hand-beaker contact parameters cover the target and the
+  beads too. `max_collision_pairs=30` leaves room for 150 contacts and 360 broad-phase pairs an env, about four times
+  the most measured (39 and 61) while pouring, spilling and acting with noised actions in 768 envs; a count past the
+  room halts the run rather than dropping contacts. In those envs no bead's centre ever entered a beaker's glass,
+  and the deepest transient penetrations were beads striking the bench (3.5 mm) or the target (3 mm).
+- **The hand pours outward, supinating.** The target starts on the right (y −0.34 to −0.26), the source nearer the
+  middle (y −0.14 to −0.04). Turned palm up, the beaker lies in the hand, and a lift policy's grasp held it to 130° in
+  a scripted pour; turned palm down to pour inward, the beaker hangs under the hand, and it was dropped by 90° in
+  nearly every env.
+- **The goal is where the beaker's centre is while it pours.** `AnchoredT3Command` draws it 4–6 cm from the
+  target's axis toward the source and 12–14 cm above the target's centre, and the actor, which never observes the
+  target, finds it at a fixed offset from the goal. A lift policy holds the beaker's centre on its goal and, tipped,
+  turns it about that centre, so from there the lip stays over the target's mouth from upright to about 120°, past
+  where the beads pour. Placed
+  11–14 cm off instead (where the swing of a beaker tipped about the hand would bring its lip over the target), the
+  goal fought the lift policy: it pulled the swinging beaker back, the lip never neared the target, and biasing the
+  starting policy's wrist toward the target lost return over an episode, where from the pour position it gains.
+  The goal terms (`UprightedGoalDistance`) measure the beaker turned back upright about the palm, the IK's control
+  point, so tipping it about the hand neither costs nor pays; a first version widened the deadband with the tilt
+  instead, and its policy tipped the beaker 40° sideways for the slack. Once the beaker pours (tipped toward the
+  target past 20°, its lip within 6 cm of over it and above its rim), the goal terms pay in full: supinating that
+  far takes the G1's elbow and wrist to their limits, where the palm sags off the goal.
+- **What pays.** The share of beads in the target pays 30 a step and the share on the bench costs 30; past half
+  spilled, or with the target knocked over, the episode ends. `PourTilt` pays the tilt toward the target
+  (`tilt_toward`: none across or away), in proportion to its angle, while the source is held and its pour lip (the
+  lowest point of its rim) is above the target's rim, weighted by how near the lip is to over the target's mouth
+  (σ 10 cm: at the goal the lip is 9–13 cm off), up to 60 a step. Leaning the held beaker across the line to the
+  target or away from it costs 20 sin² of the lean (`HeldTiltOffTarget`, the lift's upright cost with the pour's
+  direction left free). Paid on the plain tilt, a beaker tipped across earned nearly what one tipped toward the
+  target did, and a policy tipped it 20–30° sideways for good; with the direction but no cost on leaning and the
+  shaping at 25, a policy still drifted it sideways, and tipping 20° toward the target paid too little (1.5 a step)
+  to steer it; at σ 4 cm the term paid nothing short of 60°. Beads leave the lip rolling, so they drop in best with the lip about 1.5 cm short of the target's axis:
+  held over the axis, half of them hit the far rim. The lift's tilt termination and its settle-at-goal cost are
+  gone, the beaker's angular velocity costs a fifth as much, and the lift-height reward is capped at 10 cm of
+  clearance, which a beaker tipped at the goal keeps.
+- **The critic counts the beads.** It gets the lift critic's inputs and, after them, the shares in the source, in
+  the target and spilled, and the beads' centroid from the target's mouth. `warm_start` appends zero weights for
+  those to a lift checkpoint's critic, with the identity in its observation normalizer and zero Adam moments, so the
+  critic starts out computing what the lift's did. The actor is the lift's unchanged.
+- **Every episode starts from the bench.** No beaker is moved mid-episode, there is no pre-grasp start (it puts the
+  source at its home, a beaker's width from the target), and the goal-range curriculum is gone (the goal follows the
+  target). The smoothness costs sit at the lift curriculum's final weights; episodes last 10 s.
 
 ## In-hand reorientation
 
