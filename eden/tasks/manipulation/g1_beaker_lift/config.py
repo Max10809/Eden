@@ -959,10 +959,12 @@ def _beaker() -> CylinderOptions:
     )
 
 
-def _bench_scene(**objects: EntityOptions) -> SceneOptions:
-    """The welded G1 at the bench, with ``objects`` (entity name -> options) on it; :func:`_beaker` by default."""
+def _bench_scene(robot: EntityOptions = _ROBOT, **objects: EntityOptions) -> SceneOptions:
+    """The welded G1 (``robot``) at the bench, with ``objects`` (entity name -> options) on it; :func:`_beaker` by
+    default.
+    """
     return en.scenes.Empty(
-        robot=_ROBOT,
+        robot=robot,
         # Holds the pelvis: invisible, never in contact, welded to the robot below.
         pelvis_mount=BoxOptions(
             size=(0.02, 0.02, 0.02),

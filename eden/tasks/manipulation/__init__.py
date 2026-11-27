@@ -29,7 +29,12 @@ Registered tasks, all on the ``Droid`` robot unless noted:
 * ``manipulation_g1_beaker_lift`` (``g1_beaker_lift/config.py``) — ``manipulation_dex_lift`` on a pelvis-welded
   Unitree G1 with Dex3 hands, lifting a beaker off a lab bench and keeping it upright.
 * ``manipulation_g1_beaker_pour`` (``g1_beaker_pour/config.py``) — ``manipulation_g1_beaker_lift`` with a beaker of
-  beads to pour into a second beaker; trains on from a lift checkpoint (``g1_beaker_pour/warm_start.py``).
+  beads to pour into a second beaker and put back where it stood; trains on from a lift or earlier pour checkpoint
+  (``g1_beaker_pour/warm_start.py``).
+* ``manipulation_g1_beaker_pour_left`` (``g1_beaker_pour/config.py``, ``g1_beaker_pour/mirror.py``) — the pour mirrored for the left hand, driven
+  by a right-hand pour checkpoint as it is.
+* ``g1_beaker_pour/bimanual.py`` (a runner, not a task) — both hands on one robot, the beaker poured toward the
+  middle by the hand on its outer side, with the one right-hand pour checkpoint.
 
 Other robots reuse the MDP terms in :mod:`eden.tasks.manipulation.custom_terms` and the composite manipulator
 specs in :mod:`eden.options.robots.composite` (``Droid`` / ``COMPOSITE_ROBOT_REGISTRY``).

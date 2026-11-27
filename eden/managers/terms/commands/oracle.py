@@ -72,8 +72,9 @@ class UniformT3Command(CommandTerm):
         pass
 
     def draw_vis(self) -> None:
-        # Goal marker (eval/inference only; gated on debug_vis by the manager).
-        pos = self.oracle_pos_b
+        # Goal marker (eval/inference only; gated on debug_vis by the manager), at the published goal: a subclass may
+        # publish other than the drawn one.
+        pos = self.command
         if self.marker_frame_entity:
             ent = self.resolve_entity(self.marker_frame_entity)
             pos = ent.get_pos() + transform_by_quat(pos, ent.get_quat())

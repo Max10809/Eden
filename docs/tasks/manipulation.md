@@ -16,6 +16,7 @@ from the [task index](index.md), which also has the commands every task shares.
 | [`manipulation_dex_lift`](#dexterous-lift) | Franka + XHand1 (left) | — | 4096 |
 | [`manipulation_g1_beaker_lift`](#g1-beaker-lift) | Unitree G1 + Dex3 hands, pelvis welded | — | 4096 |
 | [`manipulation_g1_beaker_pour`](#g1-beaker-pour) | Unitree G1 + Dex3 hands, pelvis welded | — | 4096 |
+| [`manipulation_g1_beaker_pour_left`](#g1-beaker-pour-with-the-left-hand) | Unitree G1 + Dex3 hands, pelvis welded | — | 4096 |
 | [`reorient`](#in-hand-reorientation) | Wuji Hand 1 (simplified collision model) | `--hand` | 4096 |
 | [`piano`](#piano) | Two Wuji Hand 2 (beta2) | `--song` | 1024 |
 | [`omnireset`](#omnireset) | UR5e + Robotiq 2F-85 | `--robot` | 4096 |
@@ -211,9 +212,10 @@ eden train --task manipulation_g1_beaker_lift
 ## G1 beaker pour
 
 `manipulation_g1_beaker_pour` goes on from the beaker lift: the same welded G1 picks a beaker of eight glass beads (a
-stand-in for a liquid) off the bench and pours them into a second beaker beside it. Its actor observes what the
-lift's does and acts the same way, so it trains on from a lift checkpoint, widened first for its critic's extra
-inputs:
+stand-in for a liquid) off the bench with its right hand, pours them into a second beaker, inward, as a person does,
+and puts the emptied beaker back where it stood. Its actor observes what the lift's does, and whether the beaker is
+poured, and acts the same way, so it trains on from a lift checkpoint, or from one of the pour before it put the
+beaker back, widened first for the inputs it lacks:
 
 ```bash
 uv run python -m eden.tasks.manipulation.g1_beaker_pour.warm_start \
@@ -228,16 +230,52 @@ eden train --task manipulation_g1_beaker_pour --checkpoint pour_init.pt
   trained at 1400 env-steps/s, eight at 10500 (the lift runs at about 45000).
 - **Everything that touches collides.** Beads with each other, both beakers, the bench and the hand; the beakers
   with each other, the hand and the bench. The lift's stiff hand-beaker contact parameters cover the target and the
-  beads too. `max_collision_pairs=30` leaves room for 150 contacts and 360 broad-phase pairs an env, about four times
-  the most measured (39 and 61) while pouring, spilling and acting with noised actions in 768 envs; a count past the
-  room halts the run rather than dropping contacts. In those envs no bead's centre ever entered a beaker's glass,
-  and the deepest transient penetrations were beads striking the bench (3.5 mm) or the target (3 mm).
-- **The hand pours outward, supinating.** The target starts on the right (y −0.34 to −0.26), the source nearer the
-  middle (y −0.14 to −0.04). Turned palm up, the beaker lies in the hand, and a lift policy's grasp held it to 130° in
-  a scripted pour; turned palm down to pour inward, the beaker hangs under the hand, and it was dropped by 90° in
-  nearly every env.
+  beads too. `max_collision_pairs=80` leaves room for 400 candidate contacts and 960 broad-phase pairs an env; a
+  count past the room halts the run rather than dropping contacts. Genesis counts the candidates before pruning
+  them, about 20 with the beads at rest, but a beaker on its rim touches with all 16 wall panels at up to 5 points
+  each: the source put down upside down makes 80 on the bench and 184 on the target's rim, 199 in all, the most in
+  8M env-steps of a trained policy acting with exploration noise. The first budget, 30 (150 contacts), sized from
+  pruned counts, halted a run after 100M env-steps. Room costs GPU memory, not speed: at 4096 envs 9.8 GB at 80
+  against 5.9 GB at 30, at the same 16.8k env-steps/s. In noised runs no bead's centre ever entered a beaker's
+  glass.
+- **So does the arm, with the body.** Besides the lift's right forearm and hand on the torso, the right upper arm
+  and shoulder collide with the torso and the right arm with the left one, and `arm_on_torso` costs every such
+  contact. Without them, a first version's policy (pouring outward) sank its upper arm 5–10 mm into the torso in
+  every episode. With them, the upper arm meets the torso only once the shoulder pulls the arm in toward the body
+  (roll past 0.15 rad), which no pour on this bench needs.
+- **The hand pours inward, pronating.** The right hand pours toward +y, the body's middle, from the target's right;
+  the left hand pours by this policy mirrored ([below](#g1-beaker-pour-with-the-left-hand)). The first version
+  poured outward (supinating, palm up) and ran out of forearm turn: 113° of wrist roll, a quarter of it spent by the
+  grasp, against the 135° a pour takes. It made up the rest by pulling the shoulder 23° in, into the torso, and
+  bending the wrist to its limit, which it reached in 40 % of its pours. A scripted inward pour from the lift's grasp
+  reached 137° with no joint at a limit.
+- **The finger pads resist spin.** Palm down, the beaker hangs in the fingers, and point contacts let it swing out
+  about the line through them: a scripted inward pour from the lift's grasp dropped 59 % of the beakers by 130°, and
+  closing the fingers harder or turning a third as fast changed nothing. A rubber pad resists that turn over its
+  contact patch (torsional friction, `friction_torsional`, the patch radius, with
+  `EnvOptions.enable_torsional_friction`): at 1 cm the same pour held 86 % to 130°, at 0.5 cm 58 %. The hand's links
+  take 8 mm, scaled every episode with the hand's friction (0.8–2×). Whether the real pads hold as well is the
+  assumption to check on hardware.
+- **The target stands toward the middle from the source.** The source is on the right half of the bench (y −0.33 to
+  −0.02 m) and the target on its left, at least 12 cm across and no further than y +0.10 (`PlaceBeside`): with a
+  beaker tipped 120° in the lift's grasp, the IK reaches pours with the beaker's centre from y −0.35 to +0.05, and
+  further left the upper arm meets the torso. The lift's grasp closes round the source from its right, so a target on
+  that side is in the hand's way. With the target on either side, a policy knocked it over 0.4 s in, as often after
+  300 iterations as at the start, in this share of the episodes:
+
+  | Source to target | Target on the source's left | Target on its right |
+  |---|---|---|
+  | 12–18 cm | 2 % | 63 % |
+  | 18–21 cm | 3 % | 45 % |
+  | 21–25 cm | 1 % | 20 % |
+  | 25–35 cm | 0 % | 11 % |
+
+  So the hand on the source's outer side pours, toward the middle; a target further out than the source, on its side
+  of the bench, is left to no hand. A cost on the hand coming near the target did not help: biased to keep the hand
+  higher on its reach, the policy knocked the target over as often, and the cost's 2 an episode was nothing beside
+  the 300 a fall lost.
 - **The goal is where the beaker's centre is while it pours.** `AnchoredT3Command` draws it 4–6 cm from the
-  target's axis toward the source and 12–14 cm above the target's centre, and the actor, which never observes the
+  target's axis toward −y (the side the hand pours from) and 12–14 cm above the target's centre, and the actor, which never observes the
   target, finds it at a fixed offset from the goal. A lift policy holds the beaker's centre on its goal and, tipped,
   turns it about that centre, so from there the lip stays over the target's mouth from upright to about 120°, past
   where the beads pour. Placed
@@ -247,8 +285,8 @@ eden train --task manipulation_g1_beaker_pour --checkpoint pour_init.pt
   The goal terms (`UprightedGoalDistance`) measure the beaker turned back upright about the palm, the IK's control
   point, so tipping it about the hand neither costs nor pays; a first version widened the deadband with the tilt
   instead, and its policy tipped the beaker 40° sideways for the slack. Once the beaker pours (tipped toward the
-  target past 20°, its lip within 6 cm of over it and above its rim), the goal terms pay in full: supinating that
-  far takes the G1's elbow and wrist to their limits, where the palm sags off the goal.
+  target past 20°, its lip within 6 cm of over it and above its rim), the goal terms pay in full, wherever the palm
+  then is: the first version's outward pour sagged its palm off the goal at the elbow's and wrist's limits.
 - **What pays.** The share of beads in the target pays 30 a step and the share on the bench costs 30; past half
   spilled, or with the target knocked over, the episode ends. `PourTilt` pays the tilt toward the target
   (`tilt_toward`: none across or away), in proportion to its angle, while the source is held and its pour lip (the
@@ -262,13 +300,87 @@ eden train --task manipulation_g1_beaker_pour --checkpoint pour_init.pt
   held over the axis, half of them hit the far rim. The lift's tilt termination and its settle-at-goal cost are
   gone, the beaker's angular velocity costs a fifth as much, and the lift-height reward is capped at 10 cm of
   clearance, which a beaker tipped at the goal keeps.
+- **Then it puts the beaker back.** The source is poured once at most one bead is left in it, and stays so for
+  the episode (`PourThenPlaceCommand.poured`, set where the step is graded, ahead of the rewards). From then the goal
+  is 12 cm over where the source stood when the episode started, and once the source is there (within 3 cm, and
+  within 15° of upright) or at its place by another way, on it. Sent straight to its place, the pour policy took the
+  tipped beaker down through the target and knocked it over in 34 % of the episodes, within half a second; sent over
+  it, in none, carrying the beaker to 3.4 cm of the point (median), as the lift carries one to a goal. What reached,
+  held, lifted, carried and tipped the source pays only until it is poured (`PourPhaseGate` around each of those
+  terms), since each would pay for holding on; after it:
+
+  | Term | Pays a step | For |
+  |---|---|---|
+  | `source_poured` | 100 | the source poured: at least what the pour paid held tipped over the target (about 90), so putting it back never pays less than holding it there |
+  | `home_tracking`, `home_tracking_fine` | 25, 10 | `1 − tanh(d / σ)` (σ 30 cm, 5 cm) of the way left back (`distance_to_go`: to the point over the place and down, then straight to it, continuous where it turns down), times the cosine of the tilt (none past 90°) |
+  | `source_placed` | 20 | the source back: within 2 cm of its place across and 1 cm up or down, within 10° of upright |
+  | `source_released` | 20 | placed, and nothing of the robot touching it |
+  | `arm_at_rest` | 15 | released, and the arm back at its start: `1 − tanh(d / 0.5)` of its joints' distance from their default pose within the limits, less 0.25 rad of sag |
+
+  Holding the beaker tipped after the pour pays nothing of this, and a beaker dropped on its side or put down on
+  its rim earns no tracking. The arm's reward lapses if its retreat knocks the beaker off its place. Over 256
+  episodes of the widened pour checkpoint, with the place terms as above, the alternatives ranked as intended: the
+  checkpoint as it was (carrying the tipped beaker over its place) returned 1130 and dropping the beaker where it
+  poured 1128, against 1334 for a scripted return that set it back on its place in 66 %. Playing the pick-up back
+  in reverse (the recorded joint targets, or the beaker's recorded path with the hand's pose servoed to it) put it
+  back in 18 % and 4 %: the beaker shifts 16 mm and turns 14° in the hand by the end of the pour (median), and the
+  hand opening and the arm retreating knocked it 4.6 cm off its place.
 - **The critic counts the beads.** It gets the lift critic's inputs and, after them, the shares in the source, in
-  the target and spilled, and the beads' centroid from the target's mouth. `warm_start` appends zero weights for
-  those to a lift checkpoint's critic, with the identity in its observation normalizer and zero Adam moments, so the
-  critic starts out computing what the lift's did. The actor is the lift's unchanged.
+  the target and spilled, and the beads' centroid from the target's mouth. Both the actor and the critic get, last,
+  whether the source is poured (`pour_done`), the actor's only input beyond the lift's. `warm_start` appends zero
+  weights for the inputs a checkpoint lacks, with the identity in its observation normalizer and zero Adam moments,
+  so each network starts out computing what it did.
 - **Every episode starts from the bench.** No beaker is moved mid-episode, there is no pre-grasp start (it puts the
   source at its home, a beaker's width from the target), and the goal-range curriculum is gone (the goal follows the
-  target). The smoothness costs sit at the lift curriculum's final weights; episodes last 10 s.
+  target). The smoothness costs sit at the lift curriculum's final weights; episodes last 10 s, of which the pour
+  takes about 2 (a trained pour empties the source by 1.7 s, median).
+
+### G1 beaker pour with the left hand
+
+`manipulation_g1_beaker_pour_left` is the right hand's task reflected through the robot's sagittal plane (y → −y):
+the source on the left half of the bench, the left hand pouring toward −y from the target's left. It is not trained.
+Its observations and actions are expressed in the right hand's frame, so a `manipulation_g1_beaker_pour` checkpoint
+drives it as it is:
+
+```bash
+uv run eden inference --task manipulation_g1_beaker_pour_left --checkpoint <a manipulation_g1_beaker_pour model> --vis
+```
+
+`mirror_config` (`g1_beaker_pour/mirror.py`) builds it from the right task's config: every `right_*` name becomes
+`left_*` and back; a joint about x or z (a roll, a yaw, every Dex3 joint but the thumb's base) changes the sign of
+its value; every scene y, y range and yaw range flips; each observation term is scaled per component by the
+reflection's signs (an angular velocity is axial: its x and z flip); the IK's y step and its x and z turns change
+sign, and so does each Dex3 joint the reflection turns the other way (`SignedImplicitPDController`). Its tests pose
+both robots in mirrored states and check that every link is where the other's mirror image is, that the two tasks
+observe, reward and measure the same to a millimetre (the two hands' meshes differ by a fraction of one), and that
+the same action moves the left arm and hand as the mirror of the right. A term added to the right task's
+observations needs its signs in `OBSERVATION_SIGNS`, or the mirror refuses to build.
+
+### G1 beaker pour with either hand
+
+`g1_beaker_pour/bimanual.py` pours with either hand, driven by the one right-hand checkpoint (not a registered task:
+it acts with two hands, so it has a runner of its own):
+
+```bash
+uv run python -m eden.tasks.manipulation.g1_beaker_pour.bimanual \
+    --checkpoint <a manipulation_g1_beaker_pour model> --vis                    # watch, in real time
+uv run python -m eden.tasks.manipulation.g1_beaker_pour.bimanual \
+    --checkpoint <a manipulation_g1_beaker_pour model> --num_envs 256 --episodes 512   # measure
+uv run python -m eden.tasks.manipulation.g1_beaker_pour.bimanual \
+    --checkpoint <a manipulation_g1_beaker_pour model> --num_envs 1 --rec pour.mp4     # record one env
+```
+
+`bimanual_config` puts both hands on one robot: each hand's IK and Dex3 actions (13 each, the right hand's first),
+each hand's actor observations (`policy_right`, and `policy_left` from the mirrored task) with its own last action,
+and each hand's goal on the side of the target it pours from. Both arms collide with the body and each other, and
+both hands' pads resist spin. Each hand pours toward the middle, so the rule (`left_hand_for`) gives the source to
+the hand on its outer side: the right hand when the source stands right of the target, the left hand otherwise. At
+every reset `ChooseHand` lays the bench out as the single-hand task does, on a half drawn at random (the source on
+that half, the target toward the middle from it), and gives the source to the hand the rule picks; that arm starts
+at the ready pose and the other hangs at its default. A target further out than the source on its side of the
+bench is left to no hand, and so is a pair too far apart across the middle for either hand. The runner acts with the chosen hand only, the
+other's zero action holding it still, and prints per hand the share of beads poured in, spilled and left in the
+source, the share of sources put back on their place and let go of, and the share of episodes that ended early.
 
 ## In-hand reorientation
 
